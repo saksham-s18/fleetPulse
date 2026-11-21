@@ -12,7 +12,7 @@ class LivenessResponse(BaseModel):
 
 
 class ReadinessResponse(BaseModel):
-    """Response returned when the service is ready to accept traffic."""
+    """Response describing whether the service can accept traffic."""
 
-    status: Literal["ready"] = "ready"
+    status: Literal["ready", "not_ready"]
     checks: dict[str, str] = Field(default_factory=dict)

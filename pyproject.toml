@@ -10,9 +10,12 @@ readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "FleetPulse Team" }]
 dependencies = [
+    "alembic>=1.14.0,<2.0.0",
+    "asyncpg>=0.30.0,<1.0.0",
     "fastapi>=0.115.0,<1.0.0",
     "pydantic>=2.9.0,<3.0.0",
     "pydantic-settings>=2.6.0,<3.0.0",
+    "sqlalchemy[asyncio]>=2.0.36,<3.0.0",
     "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 
@@ -21,6 +24,7 @@ dev = [
     "httpx2>=2.16.0,<3.0.0",
     "mypy>=1.13.0,<2.0.0",
     "pytest>=8.3.0,<9.0.0",
+    "pytest-asyncio>=0.24.0,<2.0.0",
     "ruff>=0.7.0,<1.0.0",
 ]
 
@@ -36,6 +40,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
+known-third-party = ["alembic"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -50,6 +55,11 @@ pretty = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"
-addopts = "-ra --strict-markers --strict-config"
+addopts = "-ra --strict-markers --strict-config -m 'not integration'"
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: requires a running PostgreSQL instance (docker compose up -d postgres)",
+]

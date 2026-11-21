@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AppEnvironment = Literal["development", "staging", "production", "test"]
@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     app_version: str = Field(default="0.1.0", min_length=1)
     app_env: AppEnvironment = "development"
     log_level: LogLevel = "INFO"
+
+    # SecretStr keeps the DSN (and its password) out of reprs and log output.
+    # The local default has no password; set DATABASE_URL in `.env` for Docker.
+    database_url: SecretStr = SecretStr("postgresql+asyncpg://fleetpulse@localhost:5432/fleetpulse")
+    db_pool_size: int = Field(default=5, ge=1, le=50)
+    db_max_overflow: int = Field(default=10, ge=0, le=100)
+    db_pool_timeout_seconds: float = Field(default=30.0, gt=0)
+    db_connect_timeout_seconds: float = Field(default=5.0, gt=0)
 
     @field_validator("app_env", mode="before")
     @classmethod
