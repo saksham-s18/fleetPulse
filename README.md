@@ -1,7 +1,7 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains four milestones:
+repository currently contains five milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
@@ -12,9 +12,11 @@ repository currently contains four milestones:
 - **Milestone 4** — versioned REST APIs, validation schemas, repositories,
   service-layer business rules, explicit shipment transitions and assignment
   concurrency protection.
+- **Milestone 5A** — a validated GPS event contract and a standalone vehicle
+  simulator with predefined routes, deterministic movement and HTTP publishing.
 
-Authentication, message brokers, caches, GPS tracking and Kubernetes manifests
-remain intentionally out of scope.
+Authentication, message brokers, caches, GPS persistence, Kafka ingestion and
+Kubernetes manifests remain intentionally out of scope.
 
 ## Technology stack
 
@@ -30,6 +32,7 @@ remain intentionally out of scope.
 | Linting/formatting | Ruff                                    |
 | Static typing      | Mypy (strict)                           |
 | Testing            | Pytest + pytest-asyncio + TestClient    |
+| GPS simulation     | Python asyncio + standard-library HTTP  |
 | Project config     | `pyproject.toml`                        |
 
 ## Prerequisites
@@ -84,6 +87,7 @@ fleetpulse/
 |   |   |-- common.py            # Location, request base and Page[T]
 |   |   |-- driver.py
 |   |   |-- errors.py
+|   |   |-- gps.py               # Broker-independent GpsEvent contract
 |   |   |-- health.py
 |   |   |-- shipment.py
 |   |   |-- system.py
@@ -103,16 +107,28 @@ fleetpulse/
 |-- tests/
 |   |-- test_api_errors.py       # Error envelope and OpenAPI tests
 |   |-- test_database.py         # Unit tests (no PostgreSQL required)
+|   |-- test_gps_schema.py       # GPS contract validation tests
 |   |-- test_health.py           # Unit tests (no PostgreSQL required)
 |   |-- test_integrity_errors.py # Constraint translation tests
 |   |-- test_models.py           # Model metadata tests (no PostgreSQL required)
 |   |-- test_schemas.py          # Request/response validation tests
 |   |-- test_shipment_transitions.py
+|   |-- test_simulator.py        # Movement, transport and shutdown tests
 |   `-- integration/
 |       |-- test_api.py          # REST API tests against real PostgreSQL
 |       |-- test_assignment_concurrency.py
 |       |-- test_database.py     # Real PostgreSQL integration tests
 |       `-- test_models.py       # Constraints and relationship tests
+|-- simulator/
+|   |-- __init__.py
+|   |-- __main__.py              # python -m simulator
+|   |-- cli.py                   # Arguments, discovery and signal handling
+|   |-- generator.py             # Deterministic event generation
+|   |-- geo.py                   # Haversine distance and bearing helpers
+|   |-- routes.py                # Predefined routes and interpolation
+|   |-- runner.py                # Tick loop, duration and graceful shutdown
+|   |-- transport.py             # Publisher protocol, HTTP and dry-run transports
+|   `-- vehicles.py              # Active-vehicle discovery via the REST API
 |-- alembic.ini
 |-- compose.yaml
 |-- .env.example
@@ -249,6 +265,135 @@ Database-level guarantees:
 Timestamps use PostgreSQL `TIMESTAMP WITH TIME ZONE`. Model classes use
 SQLAlchemy 2.x typed `Mapped[...]` / `mapped_column(...)` declarations.
 
+## GPS event contract
+
+`app/schemas/gps.py` defines `GpsEvent`, the validated payload shared by the
+simulator and future ingestion components. It imports nothing from Kafka,
+SQLAlchemy or the web layer, so the same contract can be used by a device
+gateway, an HTTP endpoint or a message consumer.
+
+| Field            | Type             | Rules                                                        |
+| ---------------- | ---------------- | ------------------------------------------------------------ |
+| `event_id`       | UUID             | Required; unique per observation                              |
+| `vehicle_id`     | UUID             | Required; identifies an existing FleetPulse vehicle            |
+| `shipment_id`    | UUID or `null`   | Optional; the contract does not enforce a foreign key          |
+| `latitude`       | float            | Required; `-90` through `90` inclusive; NaN and infinity rejected |
+| `longitude`      | float            | Required; `-180` through `180` inclusive; NaN and infinity rejected |
+| `speed_kmph`     | float            | Required; `>= 0`; NaN and infinity rejected                     |
+| `heading`        | float or `null`  | Optional; `0` through `360` inclusive; `360` is north          |
+| `recorded_at`    | datetime         | Required; must be timezone-aware and is normalised to UTC      |
+| `schema_version` | string           | Defaults to `1.0`; 1–32 characters                             |
+
+Example payload:
+
+```json
+{
+  "event_id": "6f1c2b1e-9f7a-4b1a-9c2d-3a4b5c6d7e8f",
+  "vehicle_id": "0b6f2c9a-1d2e-4f3a-8b7c-9d0e1f2a3b4c",
+  "shipment_id": null,
+  "latitude": 52.5219,
+  "longitude": 13.4132,
+  "speed_kmph": 32.4,
+  "heading": 87.5,
+  "recorded_at": "2026-01-01T12:00:00Z",
+  "schema_version": "1.0"
+}
+```
+
+Validation behaviour:
+
+- Naive timestamps such as `2026-01-01T12:00:00` are rejected. Offset-aware
+  values are converted to UTC, so `14:00+02:00` becomes `12:00Z`.
+- Coordinates, speed and heading are checked inclusively at their boundaries.
+  NaN and infinite floats are rejected rather than silently persisted.
+- Unknown fields are rejected, matching the strict request-model convention.
+- `GpsEvent.model_dump(mode="json")` produces a JSON-safe document with string
+  UUIDs and ISO-8601 timestamps.
+
+## Vehicle GPS simulator
+
+`simulator/` is a standalone asyncio program that generates GPS updates for
+existing FleetPulse vehicles. It needs no physical device and no database
+connection of its own: it discovers active vehicles through the REST API (or
+accepts explicit IDs) and publishes events over a pluggable transport.
+
+Inspect the options:
+
+```powershell
+python -m simulator --help
+```
+
+Generate and log events without sending them:
+
+```powershell
+python -m simulator --dry-run --vehicles 3 --interval 1 --duration 30 --seed 42
+```
+
+Publish to an HTTP ingestion endpoint:
+
+```powershell
+python -m simulator --ingestion-url http://127.0.0.1:8000/api/v1/gps/events `
+  --vehicles 5 --interval 2 --duration 120
+```
+
+Simulate one known vehicle until interrupted:
+
+```powershell
+python -m simulator --dry-run --vehicle-id 0b6f2c9a-1d2e-4f3a-8b7c-9d0e1f2a3b4c `
+  --duration 0
+```
+
+| Option            | Default                                  | Purpose                                              |
+| ----------------- | ---------------------------------------- | ---------------------------------------------------- |
+| `--api-url`       | `http://127.0.0.1:8000`                  | FleetPulse API used to discover active vehicles       |
+| `--ingestion-url` | `http://127.0.0.1:8000/api/v1/gps/events` | HTTP endpoint that receives GPS events               |
+| `--vehicles`      | `5`                                      | Maximum number of active vehicles to simulate        |
+| `--interval`      | `1.0`                                    | Seconds between GPS updates                          |
+| `--duration`      | `60`                                     | Total run time; `0` runs until interrupted           |
+| `--seed`          | none                                     | Random seed for reproducible movement                |
+| `--vehicle-id`    | none                                     | Repeatable explicit UUID; bypasses API discovery     |
+| `--timeout`       | `10`                                     | HTTP timeout for discovery and publishing            |
+| `--dry-run`       | off                                      | Log events instead of sending HTTP requests          |
+| `--log-level`     | `INFO`                                   | `DEBUG` through `CRITICAL`                           |
+
+How the simulation works:
+
+- Active vehicles are loaded from
+  `GET /api/v1/vehicles?status=active&page_size=100`, following API pagination.
+  If fewer vehicles exist than `--vehicles`, all available vehicles are used
+  with a warning; if none exist, the simulator exits with status `1`.
+- Every vehicle is assigned a closed route from `simulator/routes.py`. Routes
+  are shuffled with the seed, so a seed also reproduces route assignment.
+- Each tick advances every vehicle by `speed × elapsed time` along its route.
+  Speed is smoothed inside the route's realistic range, and heading is the
+  compass bearing to the next waypoint.
+- One event is emitted per vehicle per tick. Event IDs are random UUID4 values,
+  and timestamps are timezone-aware UTC.
+- A seed reproduces coordinates, speeds, headings, timestamps and route
+  assignment for the same vehicle order and tick schedule. Event IDs are
+  intentionally **not** reproducible so repeated runs do not reuse IDs.
+- `SIGINT` and `SIGTERM` request a graceful stop. The current tick finishes, the
+  publisher is closed, and a summary is logged. On Windows the simulator falls
+  back to `signal.signal` because `loop.add_signal_handler` is unavailable.
+- Publishing is isolated behind the `EventPublisher` protocol.
+  `HttpEventPublisher` uses the standard library, while `DryRunPublisher` logs
+  events. A future Kafka publisher can replace them without changing the
+  generator or the tick loop.
+- Transport failures are logged and counted. The process exits with status `1`
+  if any event could not be published.
+
+Known limitations for Milestone 5A:
+
+- No GPS ingestion endpoint or GPS persistence exists yet. Posting to the
+  default ingestion URL will return `404` until a later milestone; use
+  `--dry-run` or point `--ingestion-url` at a local receiver.
+- There are no retries, backoff, batching, authentication or TLS client
+  settings in the HTTP transport.
+- Vehicle discovery requires a running API and database. `--vehicle-id` allows
+  the simulator to run without them.
+- The simulator is a repository tool and is not part of the installed wheel
+  (`packages = ["app"]`); run it from the repository root.
+
 ## Core fleet API
 
 All business endpoints are versioned under `/api/v1`. List endpoints accept
@@ -361,6 +506,17 @@ Unit tests do not require PostgreSQL:
 pytest
 ```
 
+The GPS contract and simulator tests are unit tests and need neither PostgreSQL
+nor a running API:
+
+```powershell
+pytest tests/test_gps_schema.py tests/test_simulator.py
+```
+
+They cover valid and invalid events, coordinate and heading boundaries, naive
+timestamps, deterministic event generation, seed reproducibility, route
+interpolation, unique event IDs, HTTP payloads and graceful shutdown.
+
 Integration tests require the Docker PostgreSQL service with migrations
 applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
 unreachable. They cover REST CRUD, pagination and filtering, duplicate records,
@@ -396,7 +552,7 @@ Linting, formatting and typing:
 ```powershell
 ruff check .
 ruff format --check .
-mypy app tests
+mypy app simulator tests
 ```
 
 Apply formatting automatically:
@@ -456,7 +612,8 @@ Run `alembic current` from the repository root so `.env` is found, and verify
   variables only.
 - The database engine is created once per application process and disposed
   during FastAPI shutdown.
-- Authentication, Kafka, Redis, GPS tracking and Kubernetes remain out of
-  scope for this milestone.
+- Authentication, Kafka, Redis, GPS persistence and Kubernetes remain out of
+  scope for this milestone. Milestone 5A provides only the GPS event contract
+  and an HTTP-based simulator; no GPS rows are stored.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.

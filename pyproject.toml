@@ -39,7 +39,7 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app"]
+known-first-party = ["app", "simulator"]
 known-third-party = ["alembic"]
 
 [tool.ruff.format]
@@ -49,7 +49,7 @@ quote-style = "double"
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-files = ["app", "tests"]
+files = ["app", "simulator", "tests"]
 show_error_codes = true
 pretty = true
 
