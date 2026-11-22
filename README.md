@@ -1,15 +1,20 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains the first two foundation milestones:
+repository currently contains four milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
 - **Milestone 2** — async PostgreSQL connectivity with SQLAlchemy 2.x, asyncpg,
   Alembic migrations and a Docker Compose development database.
+- **Milestone 3** — core fleet domain models for vehicles, drivers, shipments
+  and historical vehicle assignments.
+- **Milestone 4** — versioned REST APIs, validation schemas, repositories,
+  service-layer business rules, explicit shipment transitions and assignment
+  concurrency protection.
 
-No business features, ORM business models, message brokers, caches or
-Kubernetes manifests are included yet.
+Authentication, message brokers, caches, GPS tracking and Kubernetes manifests
+remain intentionally out of scope.
 
 ## Technology stack
 
@@ -43,31 +48,71 @@ management.
 fleetpulse/
 |-- app/
 |   |-- __init__.py
-|   |-- main.py                  # App factory, lifespan and engine disposal
+|   |-- main.py                  # App factory, lifespan, routers and handlers
 |   |-- api/
+|   |   |-- dependencies.py      # Session and service dependencies
+|   |   |-- errors.py            # Consistent error envelope and handlers
 |   |   `-- routes/
+|   |       |-- assignments.py   # Assignment endpoints and history
+|   |       |-- drivers.py       # Driver endpoints
 |   |       |-- health.py        # GET /health/live, GET /health/ready
-|   |       `-- root.py          # GET /
+|   |       |-- root.py          # GET /
+|   |       |-- shipments.py     # Shipment endpoints and transitions
+|   |       `-- vehicles.py      # Vehicle endpoints
 |   |-- core/
 |   |   |-- config.py            # Pydantic Settings (app + database)
+|   |   |-- exceptions.py        # Domain errors mapped to HTTP responses
 |   |   `-- logging.py           # Logging setup
 |   |-- infrastructure/
 |   |   |-- __init__.py
 |   |   `-- database.py          # Async engine, session factory, Base, probes
+|   |-- models/
+|   |   |-- __init__.py          # Central model registration for Alembic
+|   |   |-- enums.py             # Vehicle, driver and shipment statuses
+|   |   |-- vehicle.py
+|   |   |-- driver.py
+|   |   |-- shipment.py
+|   |   `-- vehicle_assignment.py
+|   |-- repositories/
+|   |   |-- assignment.py        # Assignment queries and active checks
+|   |   |-- driver.py
+|   |   |-- errors.py            # Integrity-error translation
+|   |   |-- shipment.py
+|   |   `-- vehicle.py
 |   |-- schemas/
+|   |   |-- assignment.py
+|   |   |-- common.py            # Location, request base and Page[T]
+|   |   |-- driver.py
+|   |   |-- errors.py
 |   |   |-- health.py
-|   |   `-- system.py
-|   |-- services/                # Reserved for business logic
-|   `-- repositories/            # Reserved for data access
+|   |   |-- shipment.py
+|   |   |-- system.py
+|   |   `-- vehicle.py
+|   `-- services/
+|       |-- assignment.py        # Assignment business rules
+|       |-- driver.py
+|       |-- pagination.py
+|       |-- shipment.py
+|       |-- shipment_transitions.py
+|       |-- transactions.py      # Commit/rollback and integrity translation
+|       `-- vehicle.py
 |-- alembic/
 |   |-- env.py                   # Async migration environment
 |   |-- script.py.mako
-|   `-- versions/                # Migration revisions
+|   `-- versions/                # Migration revisions (baseline included)
 |-- tests/
+|   |-- test_api_errors.py       # Error envelope and OpenAPI tests
 |   |-- test_database.py         # Unit tests (no PostgreSQL required)
 |   |-- test_health.py           # Unit tests (no PostgreSQL required)
+|   |-- test_integrity_errors.py # Constraint translation tests
+|   |-- test_models.py           # Model metadata tests (no PostgreSQL required)
+|   |-- test_schemas.py          # Request/response validation tests
+|   |-- test_shipment_transitions.py
 |   `-- integration/
-|       `-- test_database.py     # Real PostgreSQL integration tests
+|       |-- test_api.py          # REST API tests against real PostgreSQL
+|       |-- test_assignment_concurrency.py
+|       |-- test_database.py     # Real PostgreSQL integration tests
+|       `-- test_models.py       # Constraints and relationship tests
 |-- alembic.ini
 |-- compose.yaml
 |-- .env.example
@@ -175,10 +220,113 @@ alembic downgrade -1
 alembic history
 ```
 
-There are no business tables or migration revisions yet; the baseline revision
-should be created when the first model is added. Import new model modules in
-`alembic/env.py` (or from a central models module) so autogeneration can see
-their metadata.
+The baseline revision `05a337c43e7f` creates the four core tables. Alembic
+imports `app.models`, whose `__init__.py` is the central registration point, so
+new model modules must be imported there before autogenerating a migration.
+
+## Domain models
+
+| Entity              | Key fields and constraints                                                        |
+| ------------------- | --------------------------------------------------------------------------------- |
+| `Vehicle`           | UUID id, unique registration number, unique optional device id, status check      |
+| `Driver`            | UUID id, unique license number, unique optional phone, status check               |
+| `Shipment`          | UUID id, unique reference, JSONB origin/destination, status check                 |
+| `VehicleAssignment` | UUID id, vehicle/driver/shipment foreign keys, assigned/ended timestamps           |
+
+Database-level guarantees:
+
+- Status columns are `VARCHAR(32)` with named `CHECK` constraints for allowed values.
+- `vehicle_assignments.ended_at` must be `NULL` or greater than or equal to
+  `assigned_at`.
+- Three PostgreSQL partial unique indexes prevent more than one active
+  (`ended_at IS NULL`) assignment per vehicle, driver and shipment.
+- Foreign keys use `ON DELETE RESTRICT`, and parent relationships use
+  `passive_deletes=True`, so vehicles, drivers and shipments with assignment
+  history cannot be deleted and history is never cascaded away.
+- Non-unique indexes on the three assignment foreign keys support historical
+  lookups; the partial unique indexes cover the active subset.
+
+Timestamps use PostgreSQL `TIMESTAMP WITH TIME ZONE`. Model classes use
+SQLAlchemy 2.x typed `Mapped[...]` / `mapped_column(...)` declarations.
+
+## Core fleet API
+
+All business endpoints are versioned under `/api/v1`. List endpoints accept
+`page` (default `1`) and `page_size` (default `20`, maximum `100`) and return
+`items`, `total`, `page`, `page_size` and `pages`.
+
+| Method | Path                                      | Purpose                                      |
+| ------ | ----------------------------------------- | -------------------------------------------- |
+| POST   | `/api/v1/vehicles`                        | Create a vehicle                             |
+| GET    | `/api/v1/vehicles`                        | List vehicles; filter `status`, `vehicle_type` |
+| GET    | `/api/v1/vehicles/{vehicle_id}`           | Get a vehicle                                |
+| PATCH  | `/api/v1/vehicles/{vehicle_id}`           | Update a vehicle                             |
+| PATCH  | `/api/v1/vehicles/{vehicle_id}/status`    | Change vehicle status                        |
+| POST   | `/api/v1/drivers`                         | Create a driver                              |
+| GET    | `/api/v1/drivers`                         | List drivers; filter `status`                |
+| GET    | `/api/v1/drivers/{driver_id}`             | Get a driver                                 |
+| PATCH  | `/api/v1/drivers/{driver_id}`             | Update a driver                              |
+| PATCH  | `/api/v1/drivers/{driver_id}/status`      | Change driver status                         |
+| POST   | `/api/v1/shipments`                       | Create a shipment                            |
+| GET    | `/api/v1/shipments`                       | List shipments; filter `status`              |
+| GET    | `/api/v1/shipments/{shipment_id}`         | Get a shipment                               |
+| PATCH  | `/api/v1/shipments/{shipment_id}`         | Update a shipment                            |
+| PATCH  | `/api/v1/shipments/{shipment_id}/status`  | Apply an allowed status transition           |
+| POST   | `/api/v1/assignments`                     | Assign a vehicle and driver to a shipment    |
+| GET    | `/api/v1/assignments`                     | List assignments; filter IDs and `active`    |
+| GET    | `/api/v1/assignments/{assignment_id}`     | Get an assignment                            |
+| POST   | `/api/v1/assignments/{assignment_id}/end` | End an assignment and preserve history       |
+| GET    | `/api/v1/vehicles/{vehicle_id}/assignments` | Vehicle assignment history                 |
+| GET    | `/api/v1/drivers/{driver_id}/assignments` | Driver assignment history                    |
+| GET    | `/api/v1/shipments/{shipment_id}/assignments` | Shipment assignment history              |
+
+Shipment status transitions are explicit:
+
+| Current      | Allowed targets             |
+| ------------ | --------------------------- |
+| `created`    | `assigned`, `cancelled`     |
+| `assigned`   | `in_transit`, `cancelled`   |
+| `in_transit` | `delivered`, `cancelled`    |
+| `delivered`  | none                        |
+| `cancelled`  | none                        |
+
+Assignment rules:
+
+- The vehicle and driver must exist and be `active`.
+- The shipment must be in `created` status.
+- A vehicle, driver and shipment may each have at most one active assignment.
+  PostgreSQL partial unique indexes are the final protection for concurrent
+  requests.
+- Creating an assignment and changing the shipment to `assigned` happen in one
+  transaction. Ending an assignment sets `ended_at`, keeps the row as history,
+  and releases an `assigned` shipment back to `created`.
+- Ending an assignment twice returns `409 Conflict`.
+- No delete endpoints are exposed. Historical assignments cannot be removed,
+  and `ON DELETE RESTRICT` protects vehicles, drivers and shipments at the
+  database level.
+
+### Error responses
+
+Every error uses one envelope and never exposes SQL, credentials or internal
+exception details:
+
+```json
+{
+  "error": {
+    "code": "conflict",
+    "message": "The vehicle already has an active assignment.",
+    "details": null
+  }
+}
+```
+
+| Status | Code               | Typical cause                              |
+| ------ | ------------------ | ------------------------------------------ |
+| 400    | `bad_request`      | Empty PATCH payload or data constraint     |
+| 404    | `not_found`        | Unknown entity or route                    |
+| 409    | `conflict`         | Duplicate value, active assignment or invalid transition |
+| 422    | `validation_error` | Schema or query validation failure         |
+| 500    | `internal_error`   | Unexpected server failure                  |
 
 ## Run the application
 
@@ -213,13 +361,35 @@ Unit tests do not require PostgreSQL:
 pytest
 ```
 
-Integration tests require the Docker PostgreSQL service and are marked
-`integration`; they fail (not skip) if PostgreSQL is unreachable:
+Integration tests require the Docker PostgreSQL service with migrations
+applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
+unreachable. They cover REST CRUD, pagination and filtering, duplicate records,
+shipment transitions, valid and invalid assignments, inactive resources,
+concurrent assignment attempts, assignment history, double-ending and
+transaction rollback:
 
 ```powershell
 docker compose up -d postgres
+alembic upgrade head
 pytest -m integration
 ```
+
+For safe migration verification, use a dedicated test database rather than one
+containing data you need to keep:
+
+```powershell
+docker compose exec -T postgres psql -U fleetpulse -d postgres `
+  -c "CREATE DATABASE fleetpulse_test;"
+
+$env:DATABASE_URL = "postgresql+asyncpg://fleetpulse:fleetpulse@localhost:55432/fleetpulse_test"
+alembic upgrade head
+pytest -m integration
+alembic downgrade -1
+alembic upgrade head
+```
+
+Adjust the port and credentials to match your `.env`. Downgrade is destructive;
+only run it against an isolated test database.
 
 Linting, formatting and typing:
 
@@ -286,5 +456,7 @@ Run `alembic current` from the repository root so `.env` is found, and verify
   variables only.
 - The database engine is created once per application process and disposed
   during FastAPI shutdown.
-- Future work (business models, Kafka, Redis, Kubernetes) is intentionally out
-  of scope for this milestone.
+- Authentication, Kafka, Redis, GPS tracking and Kubernetes remain out of
+  scope for this milestone.
+- API tests create uniquely named records and do not truncate existing data;
+  use a dedicated test database when running destructive migration checks.
