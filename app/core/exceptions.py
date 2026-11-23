@@ -39,3 +39,14 @@ class ConflictError(FleetPulseError):
 
     status_code = 409
     code = "conflict"
+
+
+class ServiceUnavailableError(FleetPulseError):
+    """A downstream delivery dependency is temporarily unavailable.
+
+    Used when a validated GPS event cannot be handed to the ingestion
+    pipeline (Kafka). The response never contains broker details.
+    """
+
+    status_code = 503
+    code = "service_unavailable"

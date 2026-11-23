@@ -2,13 +2,14 @@
 
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database import get_db_session
 from app.services.assignment import AssignmentService
 from app.services.driver import DriverService
 from app.services.gps import GpsIngestService
+from app.services.gps_publisher import GpsEventPublisher
 from app.services.shipment import ShipmentService
 from app.services.vehicle import VehicleService
 
@@ -31,12 +32,22 @@ def get_assignment_service(session: SessionDep) -> AssignmentService:
     return AssignmentService(session)
 
 
-def get_gps_ingest_service(session: SessionDep) -> GpsIngestService:
-    return GpsIngestService(session)
+def get_gps_publisher(request: Request) -> GpsEventPublisher:
+    """Return the application-scoped publisher created during lifespan startup."""
+    publisher: GpsEventPublisher = request.app.state.gps_publisher
+    return publisher
+
+
+def get_gps_ingest_service(
+    session: SessionDep,
+    publisher: Annotated[GpsEventPublisher, Depends(get_gps_publisher)],
+) -> GpsIngestService:
+    return GpsIngestService(session, publisher)
 
 
 VehicleServiceDep = Annotated[VehicleService, Depends(get_vehicle_service)]
 DriverServiceDep = Annotated[DriverService, Depends(get_driver_service)]
 ShipmentServiceDep = Annotated[ShipmentService, Depends(get_shipment_service)]
 AssignmentServiceDep = Annotated[AssignmentService, Depends(get_assignment_service)]
+GpsEventPublisherDep = Annotated[GpsEventPublisher, Depends(get_gps_publisher)]
 GpsIngestServiceDep = Annotated[GpsIngestService, Depends(get_gps_ingest_service)]

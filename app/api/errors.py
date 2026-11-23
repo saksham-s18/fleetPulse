@@ -21,6 +21,7 @@ _HTTP_ERROR_CODES: dict[int, str] = {
     405: "method_not_allowed",
     409: "conflict",
     422: "validation_error",
+    503: "service_unavailable",
 }
 
 

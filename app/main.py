@@ -11,6 +11,12 @@ from app.api.routes import assignments, drivers, health, locations, root, shipme
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.infrastructure.database import create_engine, create_session_factory
+from app.infrastructure.kafka import KafkaGpsEventPublisher
+from app.services.gps_publisher import (
+    GpsEventPublisher,
+    GpsPublishError,
+    UnavailableGpsEventPublisher,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +39,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db_session_factory = create_session_factory(engine)
         logger.info("Database engine initialized")
 
+        publisher: GpsEventPublisher
+        if resolved_settings.kafka_enabled:
+            kafka_publisher = KafkaGpsEventPublisher(
+                bootstrap_servers=resolved_settings.kafka_bootstrap_servers,
+                topic=resolved_settings.kafka_gps_topic,
+                partitions=resolved_settings.kafka_gps_partitions,
+                replication_factor=resolved_settings.kafka_gps_replication_factor,
+                delivery_timeout_seconds=resolved_settings.kafka_delivery_timeout_seconds,
+            )
+            try:
+                await kafka_publisher.start()
+            except GpsPublishError as exc:
+                # Kafka is required here: fail startup loudly but without
+                # leaking connection details into the message.
+                await engine.dispose()
+                logger.error(
+                    "Kafka GPS producer startup failed (%s); "
+                    "verify KAFKA_BOOTSTRAP_SERVERS and 'docker compose up -d kafka'",
+                    type(exc).__name__,
+                )
+                raise RuntimeError(
+                    "Kafka is required but the GPS producer failed to start."
+                ) from exc
+            publisher = kafka_publisher
+        else:
+            publisher = UnavailableGpsEventPublisher()
+            logger.info("Kafka disabled: GPS ingestion will answer 503")
+        app.state.gps_publisher = publisher
+
         try:
             yield
         finally:
+            await publisher.close()
             await engine.dispose()
             logger.info("Database engine disposed")
 

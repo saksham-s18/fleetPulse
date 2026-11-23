@@ -1,7 +1,7 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains six milestones:
+repository currently contains seven milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
@@ -15,11 +15,13 @@ repository currently contains six milestones:
 - **Milestone 5A** — a validated GPS event contract and a standalone vehicle
   simulator with predefined routes, deterministic movement and HTTP publishing.
 - **Milestone 5B** — a GPS ingestion endpoint (`POST /api/v1/locations`) that
-  validates GPS events against the fleet domain and temporarily accepts them
-  over HTTP (no persistence yet).
+  validates GPS events against the fleet domain.
+- **Milestone 5C.1** — a KRaft-mode Apache Kafka broker in Docker Compose and a
+  producer that publishes validated GPS events to Kafka before the API answers
+  `202 Accepted`.
 
-Authentication, message brokers, caches, durable GPS persistence, Kafka
-ingestion and Kubernetes manifests remain intentionally out of scope.
+Authentication, Kafka consumers, Redis, durable GPS persistence and Kubernetes
+manifests remain intentionally out of scope.
 
 ## Technology stack
 
@@ -31,6 +33,8 @@ ingestion and Kubernetes manifests remain intentionally out of scope.
 | Database           | PostgreSQL 16 (Docker Compose locally)  |
 | ORM / database     | SQLAlchemy 2.x async API + asyncpg      |
 | Migrations         | Alembic                                 |
+| Message broker     | Apache Kafka 3.9 (KRaft, Docker Compose) |
+| Kafka client       | aiokafka (async producer)               |
 | ASGI server        | Uvicorn                                 |
 | Linting/formatting | Ruff                                    |
 | Static typing      | Mypy (strict)                           |
@@ -72,7 +76,8 @@ fleetpulse/
 |   |   `-- logging.py           # Logging setup
 |   |-- infrastructure/
 |   |   |-- __init__.py
-|   |   `-- database.py          # Async engine, session factory, Base, probes
+|   |   |-- database.py          # Async engine, session factory, Base, probes
+|   |   `-- kafka.py             # KafkaGpsEventPublisher (producer + topic admin)
 |   |-- models/
 |   |   |-- __init__.py          # Central model registration for Alembic
 |   |   |-- enums.py             # Vehicle, driver and shipment statuses
@@ -99,7 +104,8 @@ fleetpulse/
 |   `-- services/
 |       |-- assignment.py        # Assignment business rules
 |       |-- driver.py
-|       |-- gps.py               # GPS ingestion business rules (no writes yet)
+|       |-- gps.py               # GPS ingestion: validate, then publish
+|       |-- gps_publisher.py     # GpsEventPublisher protocol and errors
 |       |-- pagination.py
 |       |-- shipment.py
 |       |-- shipment_transitions.py
@@ -113,9 +119,12 @@ fleetpulse/
 |   |-- test_api_errors.py       # Error envelope and OpenAPI tests
 |   |-- test_database.py         # Unit tests (no PostgreSQL required)
 |   |-- test_gps_ingestion_api.py # GPS endpoint wiring (no PostgreSQL)
+|   |-- test_gps_publish_service.py # Publish ordering and 503 mapping
 |   |-- test_gps_schema.py       # GPS contract validation tests
 |   |-- test_health.py           # Unit tests (no PostgreSQL required)
 |   |-- test_integrity_errors.py # Constraint translation tests
+|   |-- test_kafka_publisher.py  # Producer config, keying, failures (mocked)
+|   |-- test_lifespan_kafka.py   # Producer startup/shutdown lifecycle
 |   |-- test_models.py           # Model metadata tests (no PostgreSQL required)
 |   |-- test_schemas.py          # Request/response validation tests
 |   |-- test_shipment_transitions.py
@@ -125,6 +134,8 @@ fleetpulse/
 |       |-- test_assignment_concurrency.py
 |       |-- test_database.py     # Real PostgreSQL integration tests
 |       |-- test_gps_ingestion.py # GPS ingestion rules against PostgreSQL
+|       |-- test_gps_kafka_broker.py # Real broker round trip (marked kafka)
+|       |-- test_gps_publish_api.py  # 202/503 publication semantics
 |       `-- test_models.py       # Constraints and relationship tests
 |-- simulator/
 |   |-- __init__.py
@@ -165,6 +176,13 @@ file. Environment variables take precedence. `DATABASE_URL` is stored as a
 | `POSTGRES_USER`            | `fleetpulse`                                             | Docker Compose only                        |
 | `POSTGRES_PASSWORD`        | *(required by Compose)*                                  | Local development value only               |
 | `POSTGRES_PORT`            | `5432`                                                   | Host port mapped to the container          |
+| `KAFKA_ENABLED`            | `true`                                                   | When `true`, Kafka is required at startup; GPS ingestion publishes events. `false` runs without a broker (unit tests) and makes ingestion answer `503` |
+| `KAFKA_PORT`               | `9092`                                                   | Host port mapped to the Kafka broker (Compose only) |
+| `KAFKA_BOOTSTRAP_SERVERS`  | `localhost:9092`                                         | Broker address used by the GPS producer    |
+| `KAFKA_GPS_TOPIC`          | `gps.events`                                             | GPS events topic (created explicitly at startup) |
+| `KAFKA_GPS_PARTITIONS`     | `3`                                                      | Partition count for the GPS topic          |
+| `KAFKA_GPS_REPLICATION_FACTOR` | `1`                                                   | Single-broker local replication factor     |
+| `KAFKA_DELIVERY_TIMEOUT_SECONDS` | `30`                                                 | Upper bound for waiting on broker acknowledgement |
 
 OpenAPI documentation (`/docs`, `/redoc`, `/openapi.json`) is enabled only when
 `APP_ENV=development`.
@@ -178,27 +196,36 @@ Copy-Item .env.example .env
 The example contains local-development credentials only. Never commit `.env`
 or real secrets; it is already excluded by `.gitignore`.
 
-## Local PostgreSQL with Docker Compose
+## Local PostgreSQL and Kafka with Docker Compose
 
-Start PostgreSQL:
+Start the development services:
 
 ```powershell
-docker compose up -d postgres
+docker compose up -d postgres kafka
 docker compose ps
 ```
 
-Wait until the service reports `healthy` (the compose health check uses
-`pg_isready`). Data is stored in the named volume
+Wait until both services report `healthy` (the compose health checks use
+`pg_isready` and `kafka-broker-api-versions.sh`).
+
+**PostgreSQL** stores fleet data in the named volume
 `fleetpulse_fleetpulse_postgres_data`.
 
-Follow logs or manage the service:
+**Kafka** runs as a single KRaft broker (no ZooKeeper) from the pinned
+`apache/kafka:3.9.0` image, with the combined broker+controller role, a
+PLAINTEXT listener on `localhost:${KAFKA_PORT:-9092}` and persistent storage in
+the named volume `fleetpulse_fleetpulse_kafka_data`. Broker auto-topic creation
+is disabled (`KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`): the application creates
+its GPS topic explicitly at startup.
+
+Follow logs or manage the services:
 
 ```powershell
-docker compose logs -f postgres
-docker compose stop postgres      # stop, keep container and data
-docker compose start postgres     # start again
-docker compose down               # remove container and network, keep data
-docker compose down -v            # remove container AND database volume (destructive)
+docker compose logs -f postgres kafka
+docker compose stop kafka        # stop, keep container and data
+docker compose start kafka       # start again
+docker compose down              # remove containers and network, keep data
+docker compose down -v           # remove containers AND volumes (destructive)
 ```
 
 ## Setup (Windows PowerShell)
@@ -395,11 +422,13 @@ How the simulation works:
 - Transport failures are logged and counted. The process exits with status `1`
   if any event could not be published.
 
-Known limitations as of Milestone 5B:
+Known limitations as of Milestone 5C.1:
 
-- The HTTP ingestion endpoint validates events but does not persist them. A
-  `202` response is an acceptance acknowledgement, not a durability guarantee
-  (see "GPS ingestion" below).
+- The HTTP ingestion endpoint validates an event and publishes it to Kafka
+  before answering `202`, but nothing consumes the topic yet and no GPS rows
+  are stored. A `202` is a broker acknowledgement, not a durability guarantee
+  in PostgreSQL (see "GPS ingestion" below); when Kafka is unavailable the
+  endpoint answers `503`, which the simulator counts as a failed publication.
 - There are no retries, backoff, batching, authentication or TLS client
   settings in the HTTP transport.
 - Vehicle discovery requires a running API and database. `--vehicle-id` allows
@@ -437,7 +466,7 @@ All business endpoints are versioned under `/api/v1`. List endpoints accept
 | GET    | `/api/v1/vehicles/{vehicle_id}/assignments` | Vehicle assignment history                 |
 | GET    | `/api/v1/drivers/{driver_id}/assignments` | Driver assignment history                    |
 | GET    | `/api/v1/shipments/{shipment_id}/assignments` | Shipment assignment history              |
-| POST   | `/api/v1/locations`                     | Accept a GPS event (temporary path)      |
+| POST   | `/api/v1/locations`                     | Publish a validated GPS event to Kafka    |
 
 Shipment status transitions are explicit:
 
@@ -486,29 +515,37 @@ exception details:
 | 409    | `conflict`         | Duplicate value, active assignment or invalid transition |
 | 422    | `validation_error` | Schema or query validation failure         |
 | 500    | `internal_error`   | Unexpected server failure                  |
+| 503    | `service_unavailable` | Kafka delivery failed or is disabled    |
 
-## GPS ingestion (temporary acceptance path)
+## GPS ingestion
 
 `POST /api/v1/locations` accepts the `GpsEvent` contract described above. The
 route handler only parses the payload with the existing `GpsEvent` schema;
-all business rules live in `app/services/gps.py` (`GpsIngestService`).
+all business rules live in `app/services/gps.py` (`GpsIngestService`), which
+publishes validated events through the `GpsEventPublisher` protocol
+(`app/services/gps_publisher.py`).
 
-| Condition                                                     | Status | Error code         |
-| ------------------------------------------------------------- | ------ | ------------------ |
-| Valid event for an active vehicle                              | `202`  | —                  |
-| Unknown `vehicle_id`                                          | `404`  | `not_found`        |
-| Vehicle exists but is not `active`                            | `409`  | `conflict`         |
-| Unknown `shipment_id`                                         | `404`  | `not_found`        |
-| Shipment is not on the vehicle's current active assignment     | `409`  | `conflict`         |
-| Payload fails `GpsEvent` validation                           | `422`  | `validation_error` |
+| Condition                                                     | Status | Error code           |
+| ------------------------------------------------------------- | ------ | -------------------- |
+| Valid event, published to Kafka                               | `202`  | —                    |
+| Kafka delivery failed or Kafka disabled                       | `503`  | `service_unavailable` |
+| Unknown `vehicle_id`                                          | `404`  | `not_found`          |
+| Vehicle exists but is not `active`                            | `409`  | `conflict`           |
+| Unknown `shipment_id`                                         | `404`  | `not_found`          |
+| Shipment is not on the vehicle's current active assignment     | `409`  | `conflict`           |
+| Payload fails `GpsEvent` validation                           | `422`  | `validation_error`   |
 
-Behaviour:
+Behaviour (order matters):
 
-- Events without a `shipment_id` are accepted for any active vehicle.
-- With a `shipment_id`, the shipment must exist and sit on the vehicle's
-  **current** active assignment (`ended_at IS NULL`); events referencing a
-  past assignment are rejected.
-- A successful response is `202 Accepted`:
+1. Validate the payload against the `GpsEvent` schema.
+2. Verify the vehicle exists and is `active`.
+3. If the event references a `shipment_id`, verify the shipment exists and sits
+   on the vehicle's **current** active assignment (`ended_at IS NULL`); events
+   referencing a past assignment are rejected.
+4. Publish the event to Kafka and wait for the broker acknowledgement.
+5. Return `202 Accepted` only after the acknowledgement; never before.
+
+A successful response is:
 
 ```json
 {
@@ -520,11 +557,80 @@ Behaviour:
 }
 ```
 
-**This path is deliberately non-durable.** No GPS rows, Kafka topics, Redis
-queues or background workers exist in this milestone: `202` means only that
-the event passed validation and was accepted in-process. The service keeps
-validation and acceptance separate so the next milestone can publish to Kafka
-at the acceptance step without rewriting these rules or the endpoint.
+Validation failures never reach the publisher, and a delivery failure can never
+produce `202`: it maps to the standard error envelope with `503` and
+`service_unavailable`. The response contains no broker address, client error or
+stack trace — those details stay in server-side logs.
+
+**`persisted: false` remains accurate.** A Kafka acknowledgement means the
+broker durably accepted the event under `acks=all`; it does *not* mean the
+event is stored in PostgreSQL. No GPS table, consumer or outbox exists yet
+(see "Kafka ingestion" below).
+
+## Kafka ingestion (publish only)
+
+Kafka is the hand-off point between the HTTP API and the future processing
+stages of the platform: the API validates a GPS event and streams it into
+`gps.events`, where later milestones (consumers, geofencing, alerts, durable
+storage) will read it. This milestone implements only the producer side.
+
+### Topic design
+
+| Setting                   | Value / default            | Purpose                                    |
+| ------------------------- | -------------------------- | ------------------------------------------ |
+| `KAFKA_GPS_TOPIC`         | `gps.events`               | GPS events topic name                      |
+| `KAFKA_GPS_PARTITIONS`    | `3`                        | Partition count (local-development default) |
+| `KAFKA_GPS_REPLICATION_FACTOR` | `1`                    | Single-broker local environment            |
+| Message key               | `vehicle_id` (string UUID) | Deterministic partition assignment         |
+
+- The topic is created **explicitly at application startup** with the configured
+  partitions and replication factor; broker auto-topic creation is disabled in
+  Compose, so nothing depends on implicit broker behaviour.
+- The message key is `vehicle_id`. Kafka's default partitioner hashes the key,
+  so every event of one vehicle lands on the same partition and events for that
+  vehicle keep their relative order. Events of different vehicles may interleave
+  across partitions.
+- The value is compact UTF-8 JSON produced from `GpsEvent.model_dump(mode="json")`
+  and preserves `event_id`, `vehicle_id`, optional `shipment_id`, coordinates,
+  speed, heading, `recorded_at` and `schema_version`.
+
+### Producer lifecycle
+
+- One `KafkaGpsEventPublisher` (`app/infrastructure/kafka.py`) is created and
+  started in the FastAPI lifespan when `KAFKA_ENABLED=true`, stored on
+  `app.state.gps_publisher` and shared by all requests through dependency
+  injection; it is closed during shutdown. No producer is created per request
+  or stored in a global module variable.
+- The producer uses `acks=all` and `enable_idempotence=True`
+  (aiokafka `AIOKafkaProducer`). aiokafka retries retriable errors indefinitely
+  and has no delivery timeout, so `KAFKA_DELIVERY_TIMEOUT_SECONDS` caps the
+  total wait for the acknowledgement; exceeding it fails the publication
+  (`503`) instead of hanging the request.
+- If Kafka is required but the producer cannot start, application startup fails
+  with a clear error instead of serving an API that silently drops events.
+- When `KAFKA_ENABLED=false` (the default for the unit suite), no broker is
+  needed: an in-memory placeholder publisher rejects every publication, so
+  GPS ingestion answers `503` instead of pretending acceptance.
+
+### Acknowledgement is not persistence
+
+A `202` response means: *validated, published, broker-acknowledged*. It does
+not mean the event is queryable — there is no GPS table yet, and `persisted`
+stays `false`. If the broker is unavailable at any point, the API answers
+`503 service_unavailable` (the simulator counts it as a failed publication and
+exits non-zero); requests are not retried, buffered or queued by the API.
+
+### Current limitations
+
+- No Kafka consumers exist yet: events are produced but nothing reads them.
+- GPS events are not persisted in PostgreSQL; `persisted` is always `false`.
+- If the delivery timeout elapses, the API answers `503` (delivery not
+  confirmed). The producer may still deliver that event once the broker
+  recovers; idempotence prevents duplicates, but clients must treat `503` as
+  "unknown", not "definitely not delivered".
+- No retries, batching, compression, TLS/SASL or authentication are configured;
+  the local broker is a single KRaft node with PLAINTEXT listeners.
+- No schema registry: the JSON contract is versioned by `schema_version` only.
 
 ## Run the application
 
@@ -553,23 +659,27 @@ but cannot reach PostgreSQL. Database errors are not exposed in the response.
 
 ## Test, lint and type-check
 
-Unit tests do not require PostgreSQL:
+Unit tests do not require PostgreSQL or Kafka. The suite sets
+`KAFKA_ENABLED=false` (see `tests/conftest.py`), and the default selection
+excludes the `integration` and `kafka` markers:
 
 ```powershell
 pytest
 ```
 
-The GPS contract, GPS endpoint wiring and simulator tests are unit tests and
-need neither PostgreSQL nor a running API:
+The GPS contract, GPS endpoint wiring, GPS publisher, producer lifecycle and
+simulator tests are unit tests and need neither PostgreSQL nor a running API:
 
 ```powershell
-pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_simulator.py
+pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_simulator.py
 ```
 
 They cover valid and invalid events, coordinate and heading boundaries, naive
-timestamps, GPS endpoint payload validation and OpenAPI wiring, deterministic
-event generation, seed reproducibility, route interpolation, unique event IDs,
-HTTP payloads, HTTP publisher success/failure reporting and graceful shutdown.
+timestamps, GPS endpoint payload validation and OpenAPI wiring, producer
+configuration (`acks=all`, idempotence, JSON payload, `vehicle_id` key, topic
+creation), publish ordering and failure mapping, deterministic event
+generation, seed reproducibility, route interpolation, unique event IDs, HTTP
+payloads, HTTP publisher success/failure reporting and graceful shutdown.
 
 Integration tests require the Docker PostgreSQL service with migrations
 applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
@@ -582,6 +692,18 @@ ingestion business rules and transaction rollback:
 docker compose up -d postgres
 alembic upgrade head
 pytest -m integration
+```
+
+Kafka broker tests are marked `kafka` (excluded from both suites above). They
+need PostgreSQL **and** the Kafka broker: GPS publication semantics against
+PostgreSQL, plus real-broker round trips (JSON payload, `vehicle_id` key,
+explicit topic creation with the configured partition count, end-to-end
+`202`-then-consume). They use unique per-test topics and clean them up:
+
+```powershell
+docker compose up -d postgres kafka
+alembic upgrade head
+pytest -m kafka
 ```
 
 For safe migration verification, use a dedicated test database rather than one
@@ -659,6 +781,21 @@ development only, reset it with `docker compose down -v` followed by
 Run `alembic current` from the repository root so `.env` is found, and verify
 `DATABASE_URL` uses the `postgresql+asyncpg://` scheme.
 
+**GPS ingestion returns 503 (`service_unavailable`)**
+
+The event passed validation but could not be delivered to Kafka (or
+`KAFKA_ENABLED=false`). Check the broker:
+
+```powershell
+docker compose ps kafka
+docker compose logs kafka
+```
+
+Confirm the container is `healthy` and `KAFKA_BOOTSTRAP_SERVERS` matches the
+host port in `KAFKA_PORT`. The producer is created during startup, so restart
+the API after changing `.env`. If startup fails with "Kafka is required but the
+GPS producer failed to start", the broker was unreachable when the API booted.
+
 ## Notes
 
 - `.env` is ignored by Git; `.env.example` is committed as a template.
@@ -666,9 +803,10 @@ Run `alembic current` from the repository root so `.env` is found, and verify
   variables only.
 - The database engine is created once per application process and disposed
   during FastAPI shutdown.
-- Authentication, Kafka, Redis, durable GPS persistence and Kubernetes remain
-  out of scope. Milestones 5A and 5B provide the GPS event contract, a
-  simulator and an HTTP acceptance endpoint; events are validated but no GPS
-  rows are stored, and `persisted` is always `false` in ingestion responses.
+- Authentication, Kafka consumers, Redis, durable GPS persistence and Kubernetes
+  remain out of scope. Milestones 5A–5C.1 provide the GPS event contract, a
+  simulator, an HTTP ingestion endpoint and a Kafka producer: events are
+  validated and published to `gps.events`, but no consumer reads them and no GPS
+  rows are stored, so `persisted` is always `false` in ingestion responses.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.
