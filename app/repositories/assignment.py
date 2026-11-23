@@ -74,6 +74,20 @@ class AssignmentRepository:
         )
         return list(result.scalars().all()), int(total or 0)
 
+    async def get_active_for_vehicle(self, vehicle_id: UUID) -> VehicleAssignment | None:
+        """Return the vehicle's current assignment, if any.
+
+        The partial unique index ``uq_vehicle_assignments_active_vehicle``
+        guarantees at most one active row per vehicle.
+        """
+        result = await self._session.execute(
+            select(VehicleAssignment).where(
+                VehicleAssignment.vehicle_id == vehicle_id,
+                VehicleAssignment.ended_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def has_active_for_vehicle(self, vehicle_id: UUID) -> bool:
         return await self._has_active(VehicleAssignment.vehicle_id, vehicle_id)
 

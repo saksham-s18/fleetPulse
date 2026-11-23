@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.infrastructure.database import get_db_session
 from app.services.assignment import AssignmentService
 from app.services.driver import DriverService
+from app.services.gps import GpsIngestService
 from app.services.shipment import ShipmentService
 from app.services.vehicle import VehicleService
 
@@ -30,7 +31,12 @@ def get_assignment_service(session: SessionDep) -> AssignmentService:
     return AssignmentService(session)
 
 
+def get_gps_ingest_service(session: SessionDep) -> GpsIngestService:
+    return GpsIngestService(session)
+
+
 VehicleServiceDep = Annotated[VehicleService, Depends(get_vehicle_service)]
 DriverServiceDep = Annotated[DriverService, Depends(get_driver_service)]
 ShipmentServiceDep = Annotated[ShipmentService, Depends(get_shipment_service)]
 AssignmentServiceDep = Annotated[AssignmentService, Depends(get_assignment_service)]
+GpsIngestServiceDep = Annotated[GpsIngestService, Depends(get_gps_ingest_service)]

@@ -8,7 +8,7 @@ consumer and validated in exactly the same way.
 from datetime import UTC, datetime
 from uuid import UUID
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import RequestModel
 
@@ -41,3 +41,18 @@ class GpsEvent(RequestModel):
     schema_version: str = Field(default=GPS_SCHEMA_VERSION, min_length=1, max_length=32)
 
     _validate_recorded_at = field_validator("recorded_at")(_normalise_recorded_at)
+
+
+class GpsIngestAck(BaseModel):
+    """Acknowledgement returned by the temporary HTTP acceptance path.
+
+    ``persisted`` is always ``False`` while ingestion only validates events:
+    no GPS rows, broker or outbox exist yet, so a ``202`` response means the
+    event passed validation, not that it was durably stored.
+    """
+
+    event_id: UUID
+    vehicle_id: UUID
+    shipment_id: UUID | None
+    status: str = "accepted"
+    persisted: bool = False

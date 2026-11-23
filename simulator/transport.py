@@ -29,6 +29,34 @@ class EventPublisher(Protocol):
         ...
 
 
+def _api_error_suffix(exc: HTTPError) -> str:
+    """Extract the API's safe ``error.message`` from an HTTP error body.
+
+    The FleetPulse API answers with a structured error envelope; surfacing its
+    message makes failed publications diagnosable. Any unreadable or
+    unexpected body is ignored rather than failing the transport itself.
+    """
+    try:
+        raw = exc.read()
+    except (AttributeError, OSError, ValueError):
+        return ""
+    if not raw:
+        return ""
+    try:
+        document = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(document, dict):
+        return ""
+    error = document.get("error")
+    if not isinstance(error, dict):
+        return ""
+    message = error.get("message")
+    if isinstance(message, str) and message:
+        return f": {message}"
+    return ""
+
+
 class HttpEventPublisher:
     """POST newline-free JSON documents to an HTTP ingestion endpoint.
 
@@ -69,6 +97,7 @@ class HttpEventPublisher:
         except HTTPError as exc:
             raise TransportError(
                 f"ingestion endpoint returned HTTP {exc.code} for {self._endpoint}"
+                f"{_api_error_suffix(exc)}"
             ) from exc
         except OSError as exc:
             raise TransportError(
@@ -77,6 +106,8 @@ class HttpEventPublisher:
 
         if not 200 <= status < 300:
             raise TransportError(f"ingestion endpoint returned HTTP {status} for {self._endpoint}")
+
+        logger.debug("Ingestion endpoint accepted event (HTTP %d)", status)
 
     async def close(self) -> None:
         """No persistent resources are held by the HTTP transport."""

@@ -1,6 +1,7 @@
 """Unit tests for route movement, event generation, transport and shutdown."""
 
 import asyncio
+import io
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -448,6 +449,47 @@ async def test_http_publisher_wraps_network_errors(monkeypatch: pytest.MonkeyPat
         await publisher.publish(make_event())
 
 
+@pytest.mark.asyncio
+async def test_http_publisher_reports_api_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps({"error": {"code": "not_found", "message": "Vehicle not found."}}).encode(
+        "utf-8"
+    )
+
+    def failing_urlopen(request: Any, timeout: float) -> FakeResponse:
+        raise HTTPError(
+            "http://example.test/api/v1/locations",
+            404,
+            "not found",
+            Message(),
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr("simulator.transport.urlopen", failing_urlopen)
+    publisher = HttpEventPublisher("http://example.test/api/v1/locations")
+
+    with pytest.raises(TransportError) as excinfo:
+        await publisher.publish(make_event())
+
+    assert "404" in str(excinfo.value)
+    assert "Vehicle not found." in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_http_publisher_ignores_unreadable_error_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_urlopen(request: Any, timeout: float) -> FakeResponse:
+        raise HTTPError("http://example.test/events", 500, "boom", Message(), None)
+
+    monkeypatch.setattr("simulator.transport.urlopen", failing_urlopen)
+    publisher = HttpEventPublisher("http://example.test/events")
+
+    with pytest.raises(TransportError, match="500"):
+        await publisher.publish(make_event())
+
+
 @pytest.mark.parametrize(
     "endpoint",
     ["", "not-a-url", "ftp://example.test/events", "http:///events"],
@@ -554,6 +596,12 @@ def test_cli_parser_defaults() -> None:
     assert args.timeout_seconds == 10.0
     assert args.seed is None
     assert args.dry_run is False
+
+
+def test_cli_default_ingestion_url_targets_locations_endpoint() -> None:
+    args = build_parser().parse_args([])
+
+    assert args.ingestion_url == "http://127.0.0.1:8000/api/v1/locations"
 
 
 def _noop_configure_logging(level: str) -> None:

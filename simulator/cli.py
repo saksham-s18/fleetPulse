@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 DEFAULT_API_URL = "http://127.0.0.1:8000"
-DEFAULT_INGESTION_URL = "http://127.0.0.1:8000/api/v1/gps/events"
+DEFAULT_INGESTION_URL = "http://127.0.0.1:8000/api/v1/locations"
 
 
 def build_parser() -> argparse.ArgumentParser:

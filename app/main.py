@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.errors import register_exception_handlers
-from app.api.routes import assignments, drivers, health, root, shipments, vehicles
+from app.api.routes import assignments, drivers, health, locations, root, shipments, vehicles
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.infrastructure.database import create_engine, create_session_factory
@@ -57,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(drivers.router, prefix="/api/v1")
     app.include_router(shipments.router, prefix="/api/v1")
     app.include_router(assignments.router, prefix="/api/v1")
+    app.include_router(locations.router, prefix="/api/v1")
 
     return app
 

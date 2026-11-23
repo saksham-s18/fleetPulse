@@ -1,7 +1,7 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains five milestones:
+repository currently contains six milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
@@ -14,9 +14,12 @@ repository currently contains five milestones:
   concurrency protection.
 - **Milestone 5A** — a validated GPS event contract and a standalone vehicle
   simulator with predefined routes, deterministic movement and HTTP publishing.
+- **Milestone 5B** — a GPS ingestion endpoint (`POST /api/v1/locations`) that
+  validates GPS events against the fleet domain and temporarily accepts them
+  over HTTP (no persistence yet).
 
-Authentication, message brokers, caches, GPS persistence, Kafka ingestion and
-Kubernetes manifests remain intentionally out of scope.
+Authentication, message brokers, caches, durable GPS persistence, Kafka
+ingestion and Kubernetes manifests remain intentionally out of scope.
 
 ## Technology stack
 
@@ -59,6 +62,7 @@ fleetpulse/
 |   |       |-- assignments.py   # Assignment endpoints and history
 |   |       |-- drivers.py       # Driver endpoints
 |   |       |-- health.py        # GET /health/live, GET /health/ready
+|   |       |-- locations.py     # POST /api/v1/locations (GPS ingestion)
 |   |       |-- root.py          # GET /
 |   |       |-- shipments.py     # Shipment endpoints and transitions
 |   |       `-- vehicles.py      # Vehicle endpoints
@@ -95,6 +99,7 @@ fleetpulse/
 |   `-- services/
 |       |-- assignment.py        # Assignment business rules
 |       |-- driver.py
+|       |-- gps.py               # GPS ingestion business rules (no writes yet)
 |       |-- pagination.py
 |       |-- shipment.py
 |       |-- shipment_transitions.py
@@ -107,6 +112,7 @@ fleetpulse/
 |-- tests/
 |   |-- test_api_errors.py       # Error envelope and OpenAPI tests
 |   |-- test_database.py         # Unit tests (no PostgreSQL required)
+|   |-- test_gps_ingestion_api.py # GPS endpoint wiring (no PostgreSQL)
 |   |-- test_gps_schema.py       # GPS contract validation tests
 |   |-- test_health.py           # Unit tests (no PostgreSQL required)
 |   |-- test_integrity_errors.py # Constraint translation tests
@@ -118,6 +124,7 @@ fleetpulse/
 |       |-- test_api.py          # REST API tests against real PostgreSQL
 |       |-- test_assignment_concurrency.py
 |       |-- test_database.py     # Real PostgreSQL integration tests
+|       |-- test_gps_ingestion.py # GPS ingestion rules against PostgreSQL
 |       `-- test_models.py       # Constraints and relationship tests
 |-- simulator/
 |   |-- __init__.py
@@ -329,10 +336,16 @@ Generate and log events without sending them:
 python -m simulator --dry-run --vehicles 3 --interval 1 --duration 30 --seed 42
 ```
 
-Publish to an HTTP ingestion endpoint:
+Publish to the HTTP ingestion endpoint (the default URL):
 
 ```powershell
-python -m simulator --ingestion-url http://127.0.0.1:8000/api/v1/gps/events `
+python -m simulator --vehicles 5 --interval 2 --duration 120
+```
+
+Or point it explicitly:
+
+```powershell
+python -m simulator --ingestion-url http://127.0.0.1:8000/api/v1/locations `
   --vehicles 5 --interval 2 --duration 120
 ```
 
@@ -346,7 +359,7 @@ python -m simulator --dry-run --vehicle-id 0b6f2c9a-1d2e-4f3a-8b7c-9d0e1f2a3b4c 
 | Option            | Default                                  | Purpose                                              |
 | ----------------- | ---------------------------------------- | ---------------------------------------------------- |
 | `--api-url`       | `http://127.0.0.1:8000`                  | FleetPulse API used to discover active vehicles       |
-| `--ingestion-url` | `http://127.0.0.1:8000/api/v1/gps/events` | HTTP endpoint that receives GPS events               |
+| `--ingestion-url` | `http://127.0.0.1:8000/api/v1/locations`  | HTTP endpoint that receives GPS events               |
 | `--vehicles`      | `5`                                      | Maximum number of active vehicles to simulate        |
 | `--interval`      | `1.0`                                    | Seconds between GPS updates                          |
 | `--duration`      | `60`                                     | Total run time; `0` runs until interrupted           |
@@ -382,11 +395,11 @@ How the simulation works:
 - Transport failures are logged and counted. The process exits with status `1`
   if any event could not be published.
 
-Known limitations for Milestone 5A:
+Known limitations as of Milestone 5B:
 
-- No GPS ingestion endpoint or GPS persistence exists yet. Posting to the
-  default ingestion URL will return `404` until a later milestone; use
-  `--dry-run` or point `--ingestion-url` at a local receiver.
+- The HTTP ingestion endpoint validates events but does not persist them. A
+  `202` response is an acceptance acknowledgement, not a durability guarantee
+  (see "GPS ingestion" below).
 - There are no retries, backoff, batching, authentication or TLS client
   settings in the HTTP transport.
 - Vehicle discovery requires a running API and database. `--vehicle-id` allows
@@ -424,6 +437,7 @@ All business endpoints are versioned under `/api/v1`. List endpoints accept
 | GET    | `/api/v1/vehicles/{vehicle_id}/assignments` | Vehicle assignment history                 |
 | GET    | `/api/v1/drivers/{driver_id}/assignments` | Driver assignment history                    |
 | GET    | `/api/v1/shipments/{shipment_id}/assignments` | Shipment assignment history              |
+| POST   | `/api/v1/locations`                     | Accept a GPS event (temporary path)      |
 
 Shipment status transitions are explicit:
 
@@ -473,6 +487,45 @@ exception details:
 | 422    | `validation_error` | Schema or query validation failure         |
 | 500    | `internal_error`   | Unexpected server failure                  |
 
+## GPS ingestion (temporary acceptance path)
+
+`POST /api/v1/locations` accepts the `GpsEvent` contract described above. The
+route handler only parses the payload with the existing `GpsEvent` schema;
+all business rules live in `app/services/gps.py` (`GpsIngestService`).
+
+| Condition                                                     | Status | Error code         |
+| ------------------------------------------------------------- | ------ | ------------------ |
+| Valid event for an active vehicle                              | `202`  | —                  |
+| Unknown `vehicle_id`                                          | `404`  | `not_found`        |
+| Vehicle exists but is not `active`                            | `409`  | `conflict`         |
+| Unknown `shipment_id`                                         | `404`  | `not_found`        |
+| Shipment is not on the vehicle's current active assignment     | `409`  | `conflict`         |
+| Payload fails `GpsEvent` validation                           | `422`  | `validation_error` |
+
+Behaviour:
+
+- Events without a `shipment_id` are accepted for any active vehicle.
+- With a `shipment_id`, the shipment must exist and sit on the vehicle's
+  **current** active assignment (`ended_at IS NULL`); events referencing a
+  past assignment are rejected.
+- A successful response is `202 Accepted`:
+
+```json
+{
+  "event_id": "6f1c2b1e-9f7a-4b1a-9c2d-3a4b5c6d7e8f",
+  "vehicle_id": "0b6f2c9a-1d2e-4f3a-8b7c-9d0e1f2a3b4c",
+  "shipment_id": null,
+  "status": "accepted",
+  "persisted": false
+}
+```
+
+**This path is deliberately non-durable.** No GPS rows, Kafka topics, Redis
+queues or background workers exist in this milestone: `202` means only that
+the event passed validation and was accepted in-process. The service keeps
+validation and acceptance separate so the next milestone can publish to Kafka
+at the acceptance step without rewriting these rules or the endpoint.
+
 ## Run the application
 
 ```powershell
@@ -506,23 +559,24 @@ Unit tests do not require PostgreSQL:
 pytest
 ```
 
-The GPS contract and simulator tests are unit tests and need neither PostgreSQL
-nor a running API:
+The GPS contract, GPS endpoint wiring and simulator tests are unit tests and
+need neither PostgreSQL nor a running API:
 
 ```powershell
-pytest tests/test_gps_schema.py tests/test_simulator.py
+pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_simulator.py
 ```
 
 They cover valid and invalid events, coordinate and heading boundaries, naive
-timestamps, deterministic event generation, seed reproducibility, route
-interpolation, unique event IDs, HTTP payloads and graceful shutdown.
+timestamps, GPS endpoint payload validation and OpenAPI wiring, deterministic
+event generation, seed reproducibility, route interpolation, unique event IDs,
+HTTP payloads, HTTP publisher success/failure reporting and graceful shutdown.
 
 Integration tests require the Docker PostgreSQL service with migrations
 applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
 unreachable. They cover REST CRUD, pagination and filtering, duplicate records,
 shipment transitions, valid and invalid assignments, inactive resources,
-concurrent assignment attempts, assignment history, double-ending and
-transaction rollback:
+concurrent assignment attempts, assignment history, double-ending, GPS
+ingestion business rules and transaction rollback:
 
 ```powershell
 docker compose up -d postgres
@@ -612,8 +666,9 @@ Run `alembic current` from the repository root so `.env` is found, and verify
   variables only.
 - The database engine is created once per application process and disposed
   during FastAPI shutdown.
-- Authentication, Kafka, Redis, GPS persistence and Kubernetes remain out of
-  scope for this milestone. Milestone 5A provides only the GPS event contract
-  and an HTTP-based simulator; no GPS rows are stored.
+- Authentication, Kafka, Redis, durable GPS persistence and Kubernetes remain
+  out of scope. Milestones 5A and 5B provide the GPS event contract, a
+  simulator and an HTTP acceptance endpoint; events are validated but no GPS
+  rows are stored, and `persisted` is always `false` in ingestion responses.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.
