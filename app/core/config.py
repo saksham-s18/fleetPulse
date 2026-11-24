@@ -37,9 +37,10 @@ class Settings(BaseSettings):
     db_pool_timeout_seconds: float = Field(default=30.0, gt=0)
     db_connect_timeout_seconds: float = Field(default=5.0, gt=0)
 
-    # Kafka is used only for publishing validated GPS events (no consumers yet).
-    # When enabled it is required: application startup fails if the broker is
-    # unreachable. Set KAFKA_ENABLED=false to run without a broker (unit tests).
+    # Kafka is used for publishing validated GPS events and for the standalone
+    # consumer worker. When enabled it is required: API startup fails if the
+    # broker is unreachable. Set KAFKA_ENABLED=false to run the API without a
+    # broker (unit tests); the consumer worker always requires it.
     kafka_enabled: bool = True
     kafka_bootstrap_servers: str = Field(default="localhost:9092", min_length=1)
     kafka_gps_topic: str = Field(default="gps.events", min_length=1, max_length=249)
@@ -50,6 +51,15 @@ class Settings(BaseSettings):
     # publisher caps the total wait at this value (and uses it as the
     # per-request timeout); exceeding it fails the publication with 503.
     kafka_delivery_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    # Standalone GPS consumer worker (``python -m app.workers.gps_worker``).
+    kafka_consumer_group_id: str = Field(
+        default="fleetpulse-gps-processors", min_length=1, max_length=249
+    )
+    kafka_gps_dlq_topic: str = Field(default="gps.events.dlq", min_length=1, max_length=249)
+    kafka_max_processing_attempts: int = Field(default=3, ge=1, le=10)
+    kafka_retry_delay_seconds: float = Field(default=1.0, ge=0)
+    kafka_consumer_poll_timeout_seconds: float = Field(default=1.0, gt=0)
 
     @field_validator("app_env", mode="before")
     @classmethod

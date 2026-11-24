@@ -24,12 +24,68 @@ import logging
 
 from aiokafka import AIOKafkaProducer
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
-from aiokafka.errors import KafkaError
+from aiokafka.errors import KafkaError, TopicAlreadyExistsError
 
 from app.schemas.gps import GpsEvent
 from app.services.gps_publisher import GpsPublishError
 
 logger = logging.getLogger(__name__)
+
+
+async def ensure_topic(
+    *,
+    bootstrap_servers: str,
+    topic: str,
+    partitions: int,
+    replication_factor: int,
+    client_id: str = "fleetpulse-kafka-admin",
+) -> None:
+    """Create ``topic`` with an explicit shape unless it already exists.
+
+    Broker auto-topic creation is disabled in Compose, so both the API producer
+    and the consumer worker create their topics (GPS and dead-letter) here.
+    Errors are left unwrapped so each caller can translate them into its own
+    domain error.
+    """
+    if not bootstrap_servers:
+        raise ValueError("bootstrap_servers must not be empty")
+    if not topic:
+        raise ValueError("topic must not be empty")
+    if partitions < 1:
+        raise ValueError("partitions must be at least 1")
+    if replication_factor < 1:
+        raise ValueError("replication_factor must be at least 1")
+
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers, client_id=client_id)
+    try:
+        await admin.start()
+        existing = await admin.list_topics()
+        if topic in existing:
+            logger.info("Kafka topic %s already exists", topic)
+            return
+        try:
+            await admin.create_topics(
+                [
+                    NewTopic(
+                        topic,
+                        num_partitions=partitions,
+                        replication_factor=replication_factor,
+                    )
+                ]
+            )
+        except TopicAlreadyExistsError:
+            # The API and worker can start together; whoever loses the race
+            # simply continues with the topic the other one created.
+            logger.info("Kafka topic %s was created concurrently", topic)
+            return
+        logger.info(
+            "Created Kafka topic %s (%d partitions, replication factor %d)",
+            topic,
+            partitions,
+            replication_factor,
+        )
+    finally:
+        await admin.close()
 
 
 class KafkaGpsEventPublisher:
@@ -137,32 +193,13 @@ class KafkaGpsEventPublisher:
         Broker auto-topic creation is disabled in Compose, so ingestion
         would otherwise fail on a fresh broker.
         """
-        admin = AIOKafkaAdminClient(
-            bootstrap_servers=self._bootstrap_servers,
-            client_id="fleetpulse-gps-admin",
-        )
         try:
-            await admin.start()
-            existing = await admin.list_topics()
-            if self._topic in existing:
-                logger.info("GPS topic %s already exists", self._topic)
-                return
-            await admin.create_topics(
-                [
-                    NewTopic(
-                        self._topic,
-                        num_partitions=self._partitions,
-                        replication_factor=self._replication_factor,
-                    )
-                ]
-            )
-            logger.info(
-                "Created GPS topic %s (%d partitions, replication factor %d)",
-                self._topic,
-                self._partitions,
-                self._replication_factor,
+            await ensure_topic(
+                bootstrap_servers=self._bootstrap_servers,
+                topic=self._topic,
+                partitions=self._partitions,
+                replication_factor=self._replication_factor,
+                client_id="fleetpulse-gps-admin",
             )
         except (TimeoutError, KafkaError, OSError) as exc:
             raise GpsPublishError("GPS topic could not be created") from exc
-        finally:
-            await admin.close()

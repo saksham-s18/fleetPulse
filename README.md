@@ -1,7 +1,7 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains seven milestones:
+repository currently contains eight milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
@@ -19,9 +19,11 @@ repository currently contains seven milestones:
 - **Milestone 5C.1** — a KRaft-mode Apache Kafka broker in Docker Compose and a
   producer that publishes validated GPS events to Kafka before the API answers
   `202 Accepted`.
+- **Milestone 5C.2** — a standalone consumer worker with manual offsets,
+  in-memory deduplication, bounded retries and an explicit dead-letter topic.
 
-Authentication, Kafka consumers, Redis, durable GPS persistence and Kubernetes
-manifests remain intentionally out of scope.
+Authentication, Redis, durable GPS persistence and Kubernetes manifests remain
+intentionally out of scope.
 
 ## Technology stack
 
@@ -34,7 +36,7 @@ manifests remain intentionally out of scope.
 | ORM / database     | SQLAlchemy 2.x async API + asyncpg      |
 | Migrations         | Alembic                                 |
 | Message broker     | Apache Kafka 3.9 (KRaft, Docker Compose) |
-| Kafka client       | aiokafka (async producer)               |
+| Kafka client       | aiokafka (async producer and consumer)  |
 | ASGI server        | Uvicorn                                 |
 | Linting/formatting | Ruff                                    |
 | Static typing      | Mypy (strict)                           |
@@ -77,7 +79,8 @@ fleetpulse/
 |   |-- infrastructure/
 |   |   |-- __init__.py
 |   |   |-- database.py          # Async engine, session factory, Base, probes
-|   |   `-- kafka.py             # KafkaGpsEventPublisher (producer + topic admin)
+|   |   |-- kafka.py             # KafkaGpsEventPublisher and topic creation
+|   |   `-- kafka_consumer.py    # KafkaGpsConsumer and DLQ transport
 |   |-- models/
 |   |   |-- __init__.py          # Central model registration for Alembic
 |   |   |-- enums.py             # Vehicle, driver and shipment statuses
@@ -101,16 +104,20 @@ fleetpulse/
 |   |   |-- shipment.py
 |   |   |-- system.py
 |   |   `-- vehicle.py
-|   `-- services/
-|       |-- assignment.py        # Assignment business rules
-|       |-- driver.py
-|       |-- gps.py               # GPS ingestion: validate, then publish
-|       |-- gps_publisher.py     # GpsEventPublisher protocol and errors
-|       |-- pagination.py
-|       |-- shipment.py
-|       |-- shipment_transitions.py
-|       |-- transactions.py      # Commit/rollback and integrity translation
-|       `-- vehicle.py
+|   |-- services/
+|   |   |-- assignment.py        # Assignment business rules
+|   |   |-- driver.py
+|   |   |-- gps.py               # GPS ingestion: validate, then publish
+|   |   |-- gps_consumer.py      # Dedup, retries and quarantine pipeline
+|   |   |-- gps_publisher.py     # GpsEventPublisher protocol and errors
+|   |   |-- pagination.py
+|   |   |-- shipment.py
+|   |   |-- shipment_transitions.py
+|   |   |-- transactions.py      # Commit/rollback and integrity translation
+|   |   `-- vehicle.py
+|   `-- workers/
+|       |-- __init__.py
+|       `-- gps_worker.py        # python -m app.workers.gps_worker
 |-- alembic/
 |   |-- env.py                   # Async migration environment
 |   |-- script.py.mako
@@ -119,10 +126,12 @@ fleetpulse/
 |   |-- test_api_errors.py       # Error envelope and OpenAPI tests
 |   |-- test_database.py         # Unit tests (no PostgreSQL required)
 |   |-- test_gps_ingestion_api.py # GPS endpoint wiring (no PostgreSQL)
+|   |-- test_gps_consumer_service.py # Dedup, retries and quarantine logic
 |   |-- test_gps_publish_service.py # Publish ordering and 503 mapping
 |   |-- test_gps_schema.py       # GPS contract validation tests
 |   |-- test_health.py           # Unit tests (no PostgreSQL required)
 |   |-- test_integrity_errors.py # Constraint translation tests
+|   |-- test_kafka_consumer_infra.py # Offset commits and DLQ envelopes (mocked)
 |   |-- test_kafka_publisher.py  # Producer config, keying, failures (mocked)
 |   |-- test_lifespan_kafka.py   # Producer startup/shutdown lifecycle
 |   |-- test_models.py           # Model metadata tests (no PostgreSQL required)
@@ -134,6 +143,7 @@ fleetpulse/
 |       |-- test_assignment_concurrency.py
 |       |-- test_database.py     # Real PostgreSQL integration tests
 |       |-- test_gps_ingestion.py # GPS ingestion rules against PostgreSQL
+|       |-- test_gps_consumer_kafka.py # Consumer, offsets and DLQ (marked kafka)
 |       |-- test_gps_kafka_broker.py # Real broker round trip (marked kafka)
 |       |-- test_gps_publish_api.py  # 202/503 publication semantics
 |       `-- test_models.py       # Constraints and relationship tests
@@ -183,6 +193,11 @@ file. Environment variables take precedence. `DATABASE_URL` is stored as a
 | `KAFKA_GPS_PARTITIONS`     | `3`                                                      | Partition count for the GPS topic          |
 | `KAFKA_GPS_REPLICATION_FACTOR` | `1`                                                   | Single-broker local replication factor     |
 | `KAFKA_DELIVERY_TIMEOUT_SECONDS` | `30`                                                 | Upper bound for waiting on broker acknowledgement |
+| `KAFKA_CONSUMER_GROUP_ID`  | `fleetpulse-gps-processors`                              | Consumer group used by the GPS worker      |
+| `KAFKA_GPS_DLQ_TOPIC`      | `gps.events.dlq`                                         | Dead-letter topic (created explicitly)     |
+| `KAFKA_MAX_PROCESSING_ATTEMPTS` | `3`                                                  | Handler attempts before dead-lettering     |
+| `KAFKA_RETRY_DELAY_SECONDS` | `1.0`                                                   | Delay between handler attempts             |
+| `KAFKA_CONSUMER_POLL_TIMEOUT_SECONDS` | `1.0`                                          | Blocking time per poll when no records arrive |
 
 OpenAPI documentation (`/docs`, `/redoc`, `/openapi.json`) is enabled only when
 `APP_ENV=development`.
@@ -564,15 +579,15 @@ stack trace — those details stay in server-side logs.
 
 **`persisted: false` remains accurate.** A Kafka acknowledgement means the
 broker durably accepted the event under `acks=all`; it does *not* mean the
-event is stored in PostgreSQL. No GPS table, consumer or outbox exists yet
+event is stored in PostgreSQL. No GPS table or outbox exists yet
 (see "Kafka ingestion" below).
 
-## Kafka ingestion (publish only)
+## Kafka ingestion (producer and consumer)
 
-Kafka is the hand-off point between the HTTP API and the future processing
-stages of the platform: the API validates a GPS event and streams it into
-`gps.events`, where later milestones (consumers, geofencing, alerts, durable
-storage) will read it. This milestone implements only the producer side.
+Kafka is the hand-off point between the HTTP API and the processing stages of
+the platform: the API validates a GPS event and streams it into `gps.events`,
+and the standalone worker consumes that topic. Geofencing, alerts and durable
+storage belong to later milestones; the worker currently logs processed events.
 
 ### Topic design
 
@@ -622,15 +637,101 @@ exits non-zero); requests are not retried, buffered or queued by the API.
 
 ### Current limitations
 
-- No Kafka consumers exist yet: events are produced but nothing reads them.
+- The worker logs processed events and updates in-memory counters only.
 - GPS events are not persisted in PostgreSQL; `persisted` is always `false`.
 - If the delivery timeout elapses, the API answers `503` (delivery not
   confirmed). The producer may still deliver that event once the broker
   recovers; idempotence prevents duplicates, but clients must treat `503` as
   "unknown", not "definitely not delivered".
-- No retries, batching, compression, TLS/SASL or authentication are configured;
-  the local broker is a single KRaft node with PLAINTEXT listeners.
+- No retries, batching, compression, TLS/SASL or authentication are configured
+  for the producer; the local broker is a single KRaft node with PLAINTEXT
+  listeners.
 - No schema registry: the JSON contract is versioned by `schema_version` only.
+
+## Kafka GPS consumer worker
+
+The consumer is an **independent process**, never started by the FastAPI
+lifespan:
+
+```powershell
+docker compose up -d postgres kafka     # infrastructure only
+python -m app.workers.gps_worker        # consumes until Ctrl+C / SIGTERM
+```
+
+The worker does not touch PostgreSQL. To exercise the whole pipeline, run the
+API (`uvicorn app.main:app`) and the simulator in two more terminals while the
+worker runs. Useful options:
+
+| Option              | Default | Purpose                                          |
+| ------------------- | ------- | ------------------------------------------------ |
+| `--duration-seconds` | `0`     | Stop gracefully after N seconds; `0` until stopped |
+| `--log-level`       | settings `LOG_LEVEL` | `DEBUG` through `CRITICAL`      |
+
+Architecture: `app/infrastructure/kafka_consumer.py` owns fetching, manual
+offset commits and the DLQ producer; `app/services/gps_consumer.py` owns
+validation, deduplication, retries and the handler boundary;
+`app/workers/gps_worker.py` wires them together and handles signals. The
+default handler (`LoggingGpsEventHandler`) only logs; future milestones replace
+it with Redis/PostgreSQL projections without changing Kafka code.
+
+### Consumer group and ordering
+
+- `KAFKA_CONSUMER_GROUP_ID` defaults to `fleetpulse-gps-processors`. Run one
+  worker locally; multiple instances would share partitions through normal
+  Kafka rebalancing (and would each need their own deduplication store).
+- Messages are processed **one at a time**, and `max_poll_records=1` prevents
+  concurrent handling inside a partition. Because producers key by
+  `vehicle_id`, all events of a vehicle share a partition and keep their order.
+  Concurrency across independent partitions can be added later.
+- `KAFKA_GPS_TOPIC` and `KAFKA_GPS_DLQ_TOPIC` are created explicitly at worker
+  startup with the configured partitions and replication factor.
+
+### Manual offsets and at-least-once delivery
+
+- Automatic commits are disabled (`enable_auto_commit=False`). The worker
+  commits `record.offset + 1` for the record's partition only after the service
+  reports success, a duplicate, or a dead-letter acknowledgement.
+- A failed handler or a failed DLQ publication never commits: the worker logs
+  the failure, exits non-zero, and Kafka redelivers the message on restart.
+- Processing is therefore **at-least-once**, not exactly-once. A crash between
+  handling and committing replays the event; deduplication suppresses the
+  duplicate handler run when the event ID is still remembered.
+
+### In-memory deduplication (non-durable)
+
+- `InMemoryEventDeduplicator` tracks `event_id` values in a bounded FIFO
+  (default 100,000) behind the replaceable `EventDeduplicator` protocol.
+- An ID is marked **only after** the handler succeeds, so a failed event is
+  retried on redelivery instead of being skipped.
+- The state is process-local: it does **not** survive worker restarts and is
+  **not** shared between instances. After a restart (or FIFO eviction) a
+  redelivered event is processed again. Redis/PostgreSQL deduplication is
+  intentionally out of scope.
+
+### Retries and dead-letter handling
+
+- Invalid JSON, an empty value, or a payload that fails `GpsEvent` validation
+  is quarantined immediately (no handler call, no silent discard).
+- Handler failures are retried up to `KAFKA_MAX_PROCESSING_ATTEMPTS`
+  (default `3`) with `KAFKA_RETRY_DELAY_SECONDS` (default `1.0`). Exhausted
+  attempts are quarantined.
+- Quarantine publishes to `KAFKA_GPS_DLQ_TOPIC` (default `gps.events.dlq`) and
+  waits for the broker acknowledgement **before** the original offset is
+  committed. If the DLQ publish fails, nothing is committed.
+- The DLQ envelope carries `original_topic`, `original_partition`,
+  `original_offset`, `original_timestamp_ms`, the original key (also used as
+  the DLQ message key), `event_id` when known, the raw payload as UTF-8 or
+  base64 (`payload_encoding`), and `error: {type, message}`. Messages are
+  truncated to keep metadata bounded; no credentials are logged.
+
+### Shutdown and logging
+
+`SIGINT` and `SIGTERM` set a stop event: the worker stops fetching, finishes
+and commits the record in flight, closes the consumer and DLQ producer, and
+logs received/processed/duplicate/invalid/failure/retry/quarantined counts.
+No consumer runs inside the API process, and the worker is not a Compose
+service because the repository has no application image (Compose contains only
+PostgreSQL and Kafka; API, simulator and worker run on the host).
 
 ## Run the application
 
@@ -667,19 +768,23 @@ excludes the `integration` and `kafka` markers:
 pytest
 ```
 
-The GPS contract, GPS endpoint wiring, GPS publisher, producer lifecycle and
-simulator tests are unit tests and need neither PostgreSQL nor a running API:
+The GPS contract, GPS endpoint wiring, GPS publisher, producer lifecycle,
+consumer processing, consumer transport and simulator tests are unit tests and
+need neither PostgreSQL nor a running API:
 
 ```powershell
-pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_simulator.py
+pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_kafka_consumer_infra.py tests/test_simulator.py
 ```
 
 They cover valid and invalid events, coordinate and heading boundaries, naive
 timestamps, GPS endpoint payload validation and OpenAPI wiring, producer
 configuration (`acks=all`, idempotence, JSON payload, `vehicle_id` key, topic
-creation), publish ordering and failure mapping, deterministic event
-generation, seed reproducibility, route interpolation, unique event IDs, HTTP
-payloads, HTTP publisher success/failure reporting and graceful shutdown.
+creation), publish ordering and failure mapping, consumer JSON/schema
+validation, in-memory deduplication (including not marking failures), bounded
+retries, dead-letter envelopes, manual offset commits and commit ordering,
+graceful shutdown, deterministic event generation, seed reproducibility, route
+interpolation, unique event IDs, HTTP payloads, HTTP publisher success/failure
+reporting and simulator shutdown.
 
 Integration tests require the Docker PostgreSQL service with migrations
 applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
@@ -695,10 +800,12 @@ pytest -m integration
 ```
 
 Kafka broker tests are marked `kafka` (excluded from both suites above). They
-need PostgreSQL **and** the Kafka broker: GPS publication semantics against
-PostgreSQL, plus real-broker round trips (JSON payload, `vehicle_id` key,
-explicit topic creation with the configured partition count, end-to-end
-`202`-then-consume). They use unique per-test topics and clean them up:
+need the Kafka broker; consumer tests do not touch PostgreSQL. They cover GPS
+publication semantics against PostgreSQL, real-broker round trips (JSON payload,
+`vehicle_id` key, explicit topic creation), the producer→consumer path, key and
+content preservation, offset advancement, duplicate handling, malformed-message
+quarantine and the no-commit path when DLQ publication fails. They use unique
+per-test topics and consumer groups and clean them up:
 
 ```powershell
 docker compose up -d postgres kafka
@@ -796,6 +903,21 @@ host port in `KAFKA_PORT`. The producer is created during startup, so restart
 the API after changing `.env`. If startup fails with "Kafka is required but the
 GPS producer failed to start", the broker was unreachable when the API booted.
 
+**The GPS worker exits immediately or logs fetch failures**
+
+The worker requires Kafka even when the API runs with `KAFKA_ENABLED=false`.
+Start the broker and verify connectivity:
+
+```powershell
+docker compose ps kafka
+python -m app.workers.gps_worker --log-level DEBUG
+```
+
+Confirm `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_CONSUMER_GROUP_ID` and
+`KAFKA_GPS_TOPIC` match the running broker. If the worker reports that a message
+could not be dead-lettered, check `KAFKA_GPS_DLQ_TOPIC`; the original offset is
+intentionally left uncommitted until the DLQ acknowledges it.
+
 ## Notes
 
 - `.env` is ignored by Git; `.env.example` is committed as a template.
@@ -803,10 +925,11 @@ GPS producer failed to start", the broker was unreachable when the API booted.
   variables only.
 - The database engine is created once per application process and disposed
   during FastAPI shutdown.
-- Authentication, Kafka consumers, Redis, durable GPS persistence and Kubernetes
-  remain out of scope. Milestones 5A–5C.1 provide the GPS event contract, a
-  simulator, an HTTP ingestion endpoint and a Kafka producer: events are
-  validated and published to `gps.events`, but no consumer reads them and no GPS
-  rows are stored, so `persisted` is always `false` in ingestion responses.
+- Authentication, Redis, durable GPS persistence and Kubernetes remain out of
+  scope. Milestones 5A–5C.2 provide the GPS event contract, a simulator, an HTTP
+  ingestion endpoint, a Kafka producer and a standalone consumer worker:
+  events are validated, published to `gps.events`, consumed at-least-once and
+  logged, but no GPS rows are stored, so `persisted` is always `false` in
+  ingestion responses. The worker's deduplication is in-memory only.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.

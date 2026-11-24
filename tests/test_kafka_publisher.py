@@ -13,7 +13,7 @@ from typing import ClassVar
 from uuid import uuid4
 
 import pytest
-from aiokafka.errors import KafkaError
+from aiokafka.errors import KafkaError, TopicAlreadyExistsError
 
 from app.infrastructure.kafka import KafkaGpsEventPublisher
 from app.schemas.gps import GpsEvent
@@ -185,6 +185,18 @@ async def test_start_is_idempotent(fake_kafka: SimpleNamespace) -> None:
 
     assert len(fake_kafka.admin.instances) == 1
     assert len(fake_kafka.producer.instances) == 1
+
+
+@pytest.mark.asyncio
+async def test_topic_created_concurrently_by_the_worker_is_tolerated(
+    fake_kafka: SimpleNamespace,
+) -> None:
+    publisher = make_publisher()
+    FakeAdmin.create_error = TopicAlreadyExistsError()
+
+    await publisher.start()
+
+    assert fake_kafka.producer.instances[0].started is True
 
 
 @pytest.mark.asyncio
