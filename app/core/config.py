@@ -61,6 +61,21 @@ class Settings(BaseSettings):
     kafka_retry_delay_seconds: float = Field(default=1.0, ge=0)
     kafka_consumer_poll_timeout_seconds: float = Field(default=1.0, gt=0)
 
+    # Redis stores the live vehicle-location projection (latest location plus
+    # a GEO index). The URL is a SecretStr so a password never appears in
+    # reprs or logs. Redis is not used by the Kafka consumer yet (Milestone
+    # 6.2); the API only owns the client lifecycle for future use.
+    redis_enabled: bool = True
+    redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
+    redis_connect_timeout_seconds: float = Field(default=2.0, gt=0)
+    redis_socket_timeout_seconds: float = Field(default=2.0, gt=0)
+    redis_max_connections: int = Field(default=20, ge=1, le=1000)
+    redis_key_prefix: str = Field(default="fleetpulse", min_length=1, max_length=64)
+    # A location is stale when ``now - recorded_at`` exceeds this threshold.
+    # This is deliberately not a Redis key TTL: the last known position stays
+    # queryable and is marked stale instead of disappearing.
+    redis_location_stale_after_seconds: int = Field(default=60, ge=1)
+
     @field_validator("app_env", mode="before")
     @classmethod
     def _normalise_environment(cls, value: object) -> object:
@@ -72,6 +87,17 @@ class Settings(BaseSettings):
     def _normalise_log_level(cls, value: object) -> object:
         """Accept log levels in any casing, e.g. ``info``."""
         return value.strip().upper() if isinstance(value, str) else value
+
+    @field_validator("redis_key_prefix", mode="before")
+    @classmethod
+    def _normalise_redis_key_prefix(cls, value: object) -> object:
+        """Strip whitespace and surrounding separators from the key prefix."""
+        if not isinstance(value, str):
+            return value
+        prefix = value.strip().strip(":")
+        if not prefix or any(character.isspace() for character in prefix):
+            raise ValueError("redis_key_prefix must be a non-empty token without whitespace")
+        return prefix
 
     @property
     def is_development(self) -> bool:

@@ -1,7 +1,7 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains eight milestones:
+repository currently contains nine milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
@@ -21,9 +21,13 @@ repository currently contains eight milestones:
   `202 Accepted`.
 - **Milestone 5C.2** — a standalone consumer worker with manual offsets,
   in-memory deduplication, bounded retries and an explicit dead-letter topic.
+- **Milestone 6.1** — Redis infrastructure and a live-location projection:
+  shared async client lifecycle, namespaced latest-location hashes, a GEO
+  index and an atomic out-of-order/idempotency contract. Kafka
+  consumer-to-Redis integration is deliberately left to Milestone 6.2.
 
-Authentication, Redis, durable GPS persistence and Kubernetes manifests remain
-intentionally out of scope.
+Authentication, durable GPS persistence, location REST endpoints and
+Kubernetes manifests remain intentionally out of scope.
 
 ## Technology stack
 
@@ -35,6 +39,8 @@ intentionally out of scope.
 | Database           | PostgreSQL 16 (Docker Compose locally)  |
 | ORM / database     | SQLAlchemy 2.x async API + asyncpg      |
 | Migrations         | Alembic                                 |
+| Live state         | Redis 7.4 (Docker Compose locally)      |
+| Redis client       | redis-py asyncio (`redis.asyncio`)      |
 | Message broker     | Apache Kafka 3.9 (KRaft, Docker Compose) |
 | Kafka client       | aiokafka (async producer and consumer)  |
 | ASGI server        | Uvicorn                                 |
@@ -80,7 +86,8 @@ fleetpulse/
 |   |   |-- __init__.py
 |   |   |-- database.py          # Async engine, session factory, Base, probes
 |   |   |-- kafka.py             # KafkaGpsEventPublisher and topic creation
-|   |   `-- kafka_consumer.py    # KafkaGpsConsumer and DLQ transport
+|   |   |-- kafka_consumer.py    # KafkaGpsConsumer and DLQ transport
+|   |   `-- redis.py             # Async Redis client lifecycle and readiness
 |   |-- models/
 |   |   |-- __init__.py          # Central model registration for Alembic
 |   |   |-- enums.py             # Vehicle, driver and shipment statuses
@@ -92,6 +99,7 @@ fleetpulse/
 |   |   |-- assignment.py        # Assignment queries and active checks
 |   |   |-- driver.py
 |   |   |-- errors.py            # Integrity-error translation
+|   |   |-- live_location.py     # Redis hashes, GEO index and atomic update
 |   |   |-- shipment.py
 |   |   `-- vehicle.py
 |   |-- schemas/
@@ -101,6 +109,7 @@ fleetpulse/
 |   |   |-- errors.py
 |   |   |-- gps.py               # Broker-independent GpsEvent contract
 |   |   |-- health.py
+|   |   |-- live_location.py     # Latest-location and GEO result models
 |   |   |-- shipment.py
 |   |   |-- system.py
 |   |   `-- vehicle.py
@@ -110,6 +119,7 @@ fleetpulse/
 |   |   |-- gps.py               # GPS ingestion: validate, then publish
 |   |   |-- gps_consumer.py      # Dedup, retries and quarantine pipeline
 |   |   |-- gps_publisher.py     # GpsEventPublisher protocol and errors
+|   |   |-- live_location.py     # Validation, mapping and staleness
 |   |   |-- pagination.py
 |   |   |-- shipment.py
 |   |   |-- shipment_transitions.py
@@ -134,7 +144,10 @@ fleetpulse/
 |   |-- test_kafka_consumer_infra.py # Offset commits and DLQ envelopes (mocked)
 |   |-- test_kafka_publisher.py  # Producer config, keying, failures (mocked)
 |   |-- test_lifespan_kafka.py   # Producer startup/shutdown lifecycle
+|   |-- test_lifespan_redis.py   # Redis client startup/shutdown lifecycle
+|   |-- test_live_location.py    # Live-location unit tests (fakeredis)
 |   |-- test_models.py           # Model metadata tests (no PostgreSQL required)
+|   |-- test_redis_infrastructure.py # Redis client configuration and readiness
 |   |-- test_schemas.py          # Request/response validation tests
 |   |-- test_shipment_transitions.py
 |   |-- test_simulator.py        # Movement, transport and shutdown tests
@@ -146,6 +159,7 @@ fleetpulse/
 |       |-- test_gps_consumer_kafka.py # Consumer, offsets and DLQ (marked kafka)
 |       |-- test_gps_kafka_broker.py # Real broker round trip (marked kafka)
 |       |-- test_gps_publish_api.py  # 202/503 publication semantics
+|       |-- test_live_location_redis.py # Real Redis hashes, GEO and atomic updates
 |       `-- test_models.py       # Constraints and relationship tests
 |-- simulator/
 |   |-- __init__.py
@@ -168,8 +182,9 @@ fleetpulse/
 ## Configuration
 
 Configuration is read from environment variables, then from an optional `.env`
-file. Environment variables take precedence. `DATABASE_URL` is stored as a
-`SecretStr`, so its value is masked in logs and representations.
+file. Environment variables take precedence. `DATABASE_URL` and `REDIS_URL` are
+stored as `SecretStr`, so their values (including any password) are masked in
+logs and representations.
 
 | Variable                   | Default                                                  | Notes                                      |
 | -------------------------- | -------------------------------------------------------- | ------------------------------------------ |
@@ -198,6 +213,14 @@ file. Environment variables take precedence. `DATABASE_URL` is stored as a
 | `KAFKA_MAX_PROCESSING_ATTEMPTS` | `3`                                                  | Handler attempts before dead-lettering     |
 | `KAFKA_RETRY_DELAY_SECONDS` | `1.0`                                                   | Delay between handler attempts             |
 | `KAFKA_CONSUMER_POLL_TIMEOUT_SECONDS` | `1.0`                                          | Blocking time per poll when no records arrive |
+| `REDIS_ENABLED`            | `true`                                                   | Ping Redis at startup; `false` runs without Redis (unit tests) |
+| `REDIS_PORT`               | `6379`                                                   | Host port mapped to the Redis container (Compose only) |
+| `REDIS_URL`                | `redis://localhost:6379/0`                               | Async Redis URL; stored as `SecretStr`      |
+| `REDIS_CONNECT_TIMEOUT_SECONDS` | `2`                                                  | TCP connect timeout                         |
+| `REDIS_SOCKET_TIMEOUT_SECONDS` | `2`                                                   | Command socket timeout                      |
+| `REDIS_MAX_CONNECTIONS`    | `20`                                                     | Maximum size of the shared connection pool  |
+| `REDIS_KEY_PREFIX`         | `fleetpulse`                                             | Namespace for every live-location key        |
+| `REDIS_LOCATION_STALE_AFTER_SECONDS` | `60`                                            | Age after which a location is marked stale   |
 
 OpenAPI documentation (`/docs`, `/redoc`, `/openapi.json`) is enabled only when
 `APP_ENV=development`.
@@ -211,17 +234,17 @@ Copy-Item .env.example .env
 The example contains local-development credentials only. Never commit `.env`
 or real secrets; it is already excluded by `.gitignore`.
 
-## Local PostgreSQL and Kafka with Docker Compose
+## Local PostgreSQL, Kafka and Redis with Docker Compose
 
 Start the development services:
 
 ```powershell
-docker compose up -d postgres kafka
+docker compose up -d postgres kafka redis
 docker compose ps
 ```
 
-Wait until both services report `healthy` (the compose health checks use
-`pg_isready` and `kafka-broker-api-versions.sh`).
+Wait until all services report `healthy` (the compose health checks use
+`pg_isready`, `kafka-broker-api-versions.sh` and `redis-cli ping`).
 
 **PostgreSQL** stores fleet data in the named volume
 `fleetpulse_fleetpulse_postgres_data`.
@@ -233,10 +256,19 @@ the named volume `fleetpulse_fleetpulse_kafka_data`. Broker auto-topic creation
 is disabled (`KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`): the application creates
 its GPS topic explicitly at startup.
 
+**Redis** runs from the pinned `redis:7.4.2-alpine` image on
+`localhost:${REDIS_PORT:-6379}`, with a persistent named volume
+`fleetpulse_fleetpulse_redis_data`. AOF (`appendfsync everysec`) and RDB
+snapshots (`save 60 1`) are enabled. Memory is capped at 256 MB with
+`maxmemory-policy noeviction`: live vehicle positions are never silently
+evicted; when the limit is reached Redis rejects writes instead. Redis is a
+rebuildable projection, not the source of truth — see "Redis persistence and
+recovery" for what survives a restart or volume loss.
+
 Follow logs or manage the services:
 
 ```powershell
-docker compose logs -f postgres kafka
+docker compose logs -f postgres kafka redis
 docker compose stop kafka        # stop, keep container and data
 docker compose start kafka       # start again
 docker compose down              # remove containers and network, keep data
@@ -658,9 +690,9 @@ docker compose up -d postgres kafka     # infrastructure only
 python -m app.workers.gps_worker        # consumes until Ctrl+C / SIGTERM
 ```
 
-The worker does not touch PostgreSQL. To exercise the whole pipeline, run the
-API (`uvicorn app.main:app`) and the simulator in two more terminals while the
-worker runs. Useful options:
+The worker does not touch PostgreSQL or Redis yet. To exercise the whole
+pipeline, run the API (`uvicorn app.main:app`) and the simulator in two more
+terminals while the worker runs. Useful options:
 
 | Option              | Default | Purpose                                          |
 | ------------------- | ------- | ------------------------------------------------ |
@@ -733,6 +765,123 @@ No consumer runs inside the API process, and the worker is not a Compose
 service because the repository has no application image (Compose contains only
 PostgreSQL and Kafka; API, simulator and worker run on the host).
 
+## Redis live-location projection (Milestone 6.1)
+
+Redis stores the current position of every reporting vehicle so later
+milestones can answer "where is it now?" and "what is nearby?" without
+scanning PostgreSQL. It is a **rebuildable projection**: PostgreSQL remains
+the durable domain store and Kafka remains the event log. Redis is not the
+source of truth.
+
+**Milestone 6.1 does not connect the Kafka consumer to Redis.** The
+repository and service exist and are fully tested, but `gps_consumer.py` and
+`app/workers/gps_worker.py` still use the logging handler. Wiring the consumer
+to `LiveLocationService.update_from_event` belongs to Milestone 6.2, as do
+location REST endpoints.
+
+### Key naming and data structures
+
+Every key is namespaced by `REDIS_KEY_PREFIX` (default `fleetpulse`):
+
+| Key                                  | Type            | Purpose                                      |
+| ------------------------------------ | --------------- | -------------------------------------------- |
+| `{prefix}:live:location:{vehicle_id}` | hash           | Latest observation for one vehicle           |
+| `{prefix}:live:geo`                   | GEO sorted set | Vehicle coordinates for radius queries       |
+
+The latest-location hash fields are:
+
+| Field            | Stored as                    | Notes                                   |
+| ---------------- | ---------------------------- | --------------------------------------- |
+| `vehicle_id`     | UUID string                  | Hash owner and GEO member               |
+| `event_id`       | UUID string                  | Idempotency and tie-break key           |
+| `latitude`       | decimal string               | `-90` … `90`                            |
+| `longitude`      | decimal string               | `-180` … `180`                          |
+| `speed_kmh`      | decimal string               | Maps `GpsEvent.speed_kmph`              |
+| `heading`        | decimal string or `""`       | Empty string represents a missing value |
+| `recorded_at`    | ISO-8601 UTC string          | Device observation time                 |
+| `recorded_at_ms` | integer string               | Ordering field used by the Lua script   |
+| `received_at`    | ISO-8601 UTC string          | When the projection accepted the event  |
+| `received_at_ms` | integer string               | Numeric form of `received_at`           |
+| `shipment_id`    | UUID string or `""`          | Optional shipment context               |
+
+The hash deliberately has **no TTL**. A vehicle that stops sending events
+keeps its last known position; freshness is calculated from timestamps (see
+below) instead of deleting data.
+
+The GEO sorted set uses the vehicle UUID as its member and stores
+`(longitude, latitude)`. `GEOADD` adds or moves a vehicle, `GEOPOS` returns its
+coordinates and `GEOSEARCH ... BYRADIUS` returns nearby vehicles ordered by
+distance. A radius result is therefore backed by the same accepted update that
+wrote the hash.
+
+### Ordering, idempotency and atomicity
+
+GPS events can be duplicated or delivered out of order. One Lua script performs
+the whole update atomically:
+
+1. Read the stored `recorded_at_ms` and `event_id`.
+2. If the stored `recorded_at_ms` is greater, reject the event as **stale**.
+3. If the timestamps are equal, compare the canonical UUID strings:
+   a larger `event_id` wins; an equal ID is a **duplicate**.
+4. Otherwise `HSET` the latest hash and `GEOADD` the new position in the same
+   atomic script, then report **applied**.
+
+Because the hash and GEO entry are written by one script, an accepted event
+cannot leave the hash updated while the GEO index still points at the old
+position. Redis executes the script atomically, so concurrent deliveries
+converge on the highest `(recorded_at, event_id)` pair. Repeated delivery of
+the same event changes nothing and is idempotent per event.
+
+This is **at-least-once** processing with idempotent projection writes, not
+durable exactly-once processing. A crash between Kafka handling and offset
+commit can replay an event; the update script recognises the duplicate.
+
+### Freshness and staleness
+
+`recorded_at` is the freshness source. `LiveLocationService.get_location`
+returns `stale=true` when `now - recorded_at` exceeds
+`REDIS_LOCATION_STALE_AFTER_SECONDS` (default `60`) and reports `age_seconds`.
+Future timestamps are treated as fresh with an age of zero. Staleness is a
+computed response field, never a key TTL: the last known location remains
+queryable so an operator can see where a silent vehicle was last seen.
+
+### Client lifecycle
+
+`app/infrastructure/redis.py` owns one async `redis.asyncio.Redis` client and
+one bounded connection pool per process. The FastAPI lifespan creates it,
+pings it when `REDIS_ENABLED=true`, stores it on `app.state.redis_client` and
+closes it during shutdown. `get_redis_client` and `get_live_location_service`
+in `app/api/dependencies.py` inject the shared client; no connection is
+created per request or per GPS event. Startup fails loudly (without exposing
+the URL) when Redis is required but unreachable. The `RedisClient` wrapper has
+no FastAPI dependency, so the future Kafka worker can create and close the
+same client independently. Unit tests set `REDIS_ENABLED=false` and never
+require a Redis server.
+
+### Redis persistence and recovery
+
+The Compose service persists to `fleetpulse_fleetpulse_redis_data` using AOF
+(everysec) plus RDB snapshots, so ordinary container restarts retain live
+state. Those mechanisms are not a durability guarantee:
+
+- AOF `everysec` can lose roughly the last second of accepted writes on a hard
+  crash; RDB snapshots are point-in-time and can be older.
+- Deleting the volume (`docker compose down -v`) or losing the host disk loses
+  the projection entirely.
+- The local deployment is a single Redis node with no replication or failover.
+- Kafka currently retains GPS events according to broker defaults, which are
+  not configured for indefinite replay. Redis cannot be guaranteed fully
+  reconstructible until retention is explicitly sized for the rebuild window.
+- No replay/rebuild worker exists yet, and the consumer is not integrated with
+  Redis in this milestone.
+
+A future rebuild process would clear the configured namespace, reset or seek
+the consumer group to the earliest retained offset and replay `gps.events`
+through the same idempotent update contract. Because updates are ordered by
+`recorded_at` and `event_id`, replaying retained events in any order converges
+on the same latest state. That worker, retention tuning and an operational
+rebuild runbook are later milestones; this milestone only documents the path.
+
 ## Run the application
 
 ```powershell
@@ -760,20 +909,20 @@ but cannot reach PostgreSQL. Database errors are not exposed in the response.
 
 ## Test, lint and type-check
 
-Unit tests do not require PostgreSQL or Kafka. The suite sets
-`KAFKA_ENABLED=false` (see `tests/conftest.py`), and the default selection
-excludes the `integration` and `kafka` markers:
+Unit tests do not require PostgreSQL, Kafka or Redis. The suite sets
+`KAFKA_ENABLED=false` and `REDIS_ENABLED=false` (see `tests/conftest.py`), and
+the default selection excludes the `integration`, `kafka` and `redis` markers:
 
 ```powershell
 pytest
 ```
 
 The GPS contract, GPS endpoint wiring, GPS publisher, producer lifecycle,
-consumer processing, consumer transport and simulator tests are unit tests and
-need neither PostgreSQL nor a running API:
+consumer processing, consumer transport, Redis live-location and simulator
+tests are unit tests and need no infrastructure:
 
 ```powershell
-pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_kafka_consumer_infra.py tests/test_simulator.py
+pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_kafka_consumer_infra.py tests/test_live_location.py tests/test_redis_infrastructure.py tests/test_lifespan_redis.py tests/test_simulator.py
 ```
 
 They cover valid and invalid events, coordinate and heading boundaries, naive
@@ -782,9 +931,12 @@ configuration (`acks=all`, idempotence, JSON payload, `vehicle_id` key, topic
 creation), publish ordering and failure mapping, consumer JSON/schema
 validation, in-memory deduplication (including not marking failures), bounded
 retries, dead-letter envelopes, manual offset commits and commit ordering,
-graceful shutdown, deterministic event generation, seed reproducibility, route
-interpolation, unique event IDs, HTTP payloads, HTTP publisher success/failure
-reporting and simulator shutdown.
+graceful shutdown, Redis key namespacing, hash serialisation, atomic updates,
+duplicate and out-of-order handling, GEO lookups, staleness, Redis error
+translation, the Redis lifespan, deterministic event generation, seed
+reproducibility, route interpolation, unique event IDs, HTTP payloads, HTTP
+publisher success/failure reporting and simulator shutdown. The live-location
+unit tests use `fakeredis` (including Lua) and never need a server.
 
 Integration tests require the Docker PostgreSQL service with migrations
 applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
@@ -799,7 +951,7 @@ alembic upgrade head
 pytest -m integration
 ```
 
-Kafka broker tests are marked `kafka` (excluded from both suites above). They
+Kafka broker tests are marked `kafka` (excluded from the default suite). They
 need the Kafka broker; consumer tests do not touch PostgreSQL. They cover GPS
 publication semantics against PostgreSQL, real-broker round trips (JSON payload,
 `vehicle_id` key, explicit topic creation), the producer→consumer path, key and
@@ -811,6 +963,18 @@ per-test topics and consumer groups and clean them up:
 docker compose up -d postgres kafka
 alembic upgrade head
 pytest -m kafka
+```
+
+Redis integration tests are marked `redis` (also excluded from the default
+suite). They need the Compose Redis service and cover connection/ping,
+write/read, GEO radius lookup, atomic updates, duplicate and out-of-order
+events, concurrent delivery convergence and repeated updates that must leave
+the hash and GEO index consistent. Every test uses an isolated key namespace
+and deletes its keys:
+
+```powershell
+docker compose up -d redis
+pytest -m redis
 ```
 
 For safe migration verification, use a dedicated test database rather than one
@@ -918,18 +1082,37 @@ Confirm `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_CONSUMER_GROUP_ID` and
 could not be dead-lettered, check `KAFKA_GPS_DLQ_TOPIC`; the original offset is
 intentionally left uncommitted until the DLQ acknowledges it.
 
+**The API fails at startup with "Redis is required"**
+
+`REDIS_ENABLED=true` (the default) pings Redis during the FastAPI lifespan.
+Check the service and URL:
+
+```powershell
+docker compose ps redis
+docker compose logs redis
+```
+
+Confirm the container is `healthy` and `REDIS_URL` matches `REDIS_PORT`. Unit
+tests set `REDIS_ENABLED=false`; do not disable Redis to work around a real
+connectivity problem in development. Redis errors never include the URL or
+credentials.
+
 ## Notes
 
 - `.env` is ignored by Git; `.env.example` is committed as a template.
 - Do not commit credentials or other secrets. Supply them through environment
   variables only.
-- The database engine is created once per application process and disposed
-  during FastAPI shutdown.
-- Authentication, Redis, durable GPS persistence and Kubernetes remain out of
-  scope. Milestones 5A–5C.2 provide the GPS event contract, a simulator, an HTTP
-  ingestion endpoint, a Kafka producer and a standalone consumer worker:
-  events are validated, published to `gps.events`, consumed at-least-once and
-  logged, but no GPS rows are stored, so `persisted` is always `false` in
-  ingestion responses. The worker's deduplication is in-memory only.
+- The database engine and Redis client are each created once per application
+  process and disposed during FastAPI shutdown.
+- Authentication, durable GPS persistence, location REST endpoints and
+  Kubernetes remain out of scope. Milestones 5A–5C.2 provide the GPS event
+  contract, a simulator, an HTTP ingestion endpoint, a Kafka producer and a
+  standalone consumer worker: events are validated, published to `gps.events`,
+  consumed at-least-once and logged, but no GPS rows are stored, so `persisted`
+  is always `false` in ingestion responses. The worker's deduplication is
+  in-memory only.
+- Milestone 6.1 adds the Redis client, live-location repository and service.
+  **The Kafka consumer is not connected to Redis yet**; no location endpoint is
+  exposed. Redis holds a rebuildable projection and is not the source of truth.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.

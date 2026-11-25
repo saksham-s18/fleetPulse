@@ -12,6 +12,7 @@ from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.infrastructure.database import create_engine, create_session_factory
 from app.infrastructure.kafka import KafkaGpsEventPublisher
+from app.infrastructure.redis import RedisClient, RedisUnavailableError
 from app.services.gps_publisher import (
     GpsEventPublisher,
     GpsPublishError,
@@ -68,9 +69,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info("Kafka disabled: GPS ingestion will answer 503")
         app.state.gps_publisher = publisher
 
+        # Redis is a rebuildable live-state projection. The client is created
+        # once per process and shared; no connection is opened per request.
+        # When disabled (unit tests), no readiness check is attempted but the
+        # lazily connecting client still exists for dependency injection.
+        redis = RedisClient(resolved_settings)
+        app.state.redis_client = redis.client
+        if resolved_settings.redis_enabled:
+            try:
+                await redis.start()
+            except RedisUnavailableError as exc:
+                await redis.close()
+                await publisher.close()
+                await engine.dispose()
+                logger.error(
+                    "Redis startup failed (%s); verify REDIS_URL and 'docker compose up -d redis'",
+                    type(exc).__name__,
+                )
+                raise RuntimeError(
+                    "Redis is required but the live-location client failed to start."
+                ) from exc
+        else:
+            logger.info("Redis disabled: live-location startup check skipped")
+
         try:
             yield
         finally:
+            await redis.close()
             await publisher.close()
             await engine.dispose()
             logger.info("Database engine disposed")

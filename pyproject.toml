@@ -16,12 +16,14 @@ dependencies = [
     "fastapi>=0.115.0,<1.0.0",
     "pydantic>=2.9.0,<3.0.0",
     "pydantic-settings>=2.6.0,<3.0.0",
+    "redis>=5.2.0,<7.0.0",
     "sqlalchemy[asyncio]>=2.0.36,<3.0.0",
     "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "fakeredis[lua]>=2.26.0,<3.0.0",
     "httpx2>=2.16.0,<3.0.0",
     "mypy>=1.13.0,<2.0.0",
     "pytest>=8.3.0,<9.0.0",
@@ -60,9 +62,14 @@ pretty = true
 module = ["aiokafka", "aiokafka.*"]
 ignore_missing_imports = true
 
+# fakeredis is a test-only dependency and does not ship type stubs.
+[[tool.mypy.overrides]]
+module = ["fakeredis", "fakeredis.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "8.0"
-addopts = "-ra --strict-markers --strict-config -m 'not integration and not kafka'"
+addopts = "-ra --strict-markers --strict-config -m 'not integration and not kafka and not redis'"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "strict"
@@ -70,4 +77,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: requires a running PostgreSQL instance (docker compose up -d postgres)",
     "kafka: requires PostgreSQL and the Kafka broker (docker compose up -d postgres kafka)",
+    "redis: requires the Redis service (docker compose up -d redis)",
 ]

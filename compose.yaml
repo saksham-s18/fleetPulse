@@ -52,6 +52,40 @@ services:
       retries: 10
       start_period: 20s
 
+  redis:
+    # Pinned official image. Redis is the live-location projection, not the
+    # source of truth: AOF (everysec) plus RDB snapshots survive container
+    # restarts, but a lost volume can only be rebuilt from retained Kafka
+    # events (see README, "Redis persistence and recovery").
+    image: redis:7.4.2-alpine
+    container_name: fleetpulse-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60 1"
+      # Live vehicle state must never be silently evicted. When the limit is
+      # reached Redis rejects writes instead of discarding a random location.
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - fleetpulse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   fleetpulse_postgres_data:
   fleetpulse_kafka_data:
+  fleetpulse_redis_data:

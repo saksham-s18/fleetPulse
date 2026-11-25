@@ -10,3 +10,6 @@ override. Tests that exercise the real broker (``-m kafka``) build their own
 import os
 
 os.environ.setdefault("KAFKA_ENABLED", "false")
+# Redis is likewise disabled for the ordinary suite: the lifespan skips the
+# readiness ping, so unit tests never require a running Redis server.
+os.environ.setdefault("REDIS_ENABLED", "false")
