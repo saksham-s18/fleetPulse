@@ -55,6 +55,38 @@ class GpsConsumeOutcome(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class GpsHandlerOutcome(StrEnum):
+    """Location-specific result reported by a projection handler.
+
+    ``APPLIED`` and ``STALE`` both mean the event was handled safely; a stale
+    event is acknowledged because a newer position is already in Redis.
+    """
+
+    APPLIED = "applied"
+    DUPLICATE = "duplicate"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class GpsHandlerResult:
+    """Optional handler result used to refine processing statistics."""
+
+    outcome: GpsHandlerOutcome
+
+
+class GpsHandlerError(Exception):
+    """A retryable downstream failure raised by an event handler.
+
+    ``failure_kind`` lets the consumer service distinguish, for example, a
+    Redis projection failure from a generic handler bug without importing
+    transport-specific exception types. The message must stay log-safe.
+    """
+
+    def __init__(self, message: str, *, failure_kind: str = "handler") -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
 @dataclass(frozen=True, slots=True)
 class GpsMessage:
     """One consumed Kafka record, stripped of the client-specific type."""
@@ -96,9 +128,13 @@ class GpsConsumerStats:
 
     received: int = 0
     processed: int = 0
+    applied: int = 0
     duplicates: int = 0
+    location_duplicates: int = 0
+    stale: int = 0
     invalid: int = 0
     handler_failures: int = 0
+    redis_failures: int = 0
     retries: int = 0
     quarantined: int = 0
 
@@ -106,8 +142,10 @@ class GpsConsumerStats:
         """Return a single-line, log-friendly counter summary."""
         return (
             f"received={self.received} processed={self.processed} "
-            f"duplicates={self.duplicates} invalid={self.invalid} "
-            f"handler_failures={self.handler_failures} retries={self.retries} "
+            f"applied={self.applied} duplicates={self.duplicates} "
+            f"location_duplicates={self.location_duplicates} stale={self.stale} "
+            f"invalid={self.invalid} handler_failures={self.handler_failures} "
+            f"redis_failures={self.redis_failures} retries={self.retries} "
             f"quarantined={self.quarantined}"
         )
 
@@ -115,11 +153,12 @@ class GpsConsumerStats:
 class GpsEventHandler(Protocol):
     """Process one validated GPS event.
 
-    Future milestones can replace the logging handler with Redis projections or
-    PostgreSQL persistence without touching the consumer service.
+    A handler may return a :class:`GpsHandlerResult` so the service can report
+    applied/duplicate/stale outcomes. Returning ``None`` keeps the original
+    "processed" behaviour for logging or other simple handlers.
     """
 
-    async def handle(self, event: GpsEvent) -> None:
+    async def handle(self, event: GpsEvent) -> GpsHandlerResult | None:
         """Process ``event``; raise to trigger the retry policy."""
         ...
 
@@ -173,20 +212,6 @@ class InMemoryEventDeduplicator:
 
     def __len__(self) -> int:
         return len(self._seen)
-
-
-class LoggingGpsEventHandler:
-    """Default handler: structured logging only (no persistence yet)."""
-
-    async def handle(self, event: GpsEvent) -> None:
-        logger.info(
-            "Processed GPS event %s for vehicle %s (recorded_at=%s, lat=%.5f, lon=%.5f)",
-            event.event_id,
-            event.vehicle_id,
-            event.recorded_at.isoformat(),
-            event.latitude,
-            event.longitude,
-        )
 
 
 class GpsConsumerService:
@@ -243,13 +268,16 @@ class GpsConsumerService:
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
-                await self._handler.handle(event)
+                handler_result = await self._handler.handle(event)
             except Exception as exc:  # explicit handler boundary: retry/quarantine
                 last_error = exc
                 self.stats.handler_failures += 1
+                if isinstance(exc, GpsHandlerError) and exc.failure_kind == "redis":
+                    self.stats.redis_failures += 1
                 logger.warning(
-                    "GPS event %s handler attempt %d/%d failed (%s)",
+                    "GPS event %s for vehicle %s handler attempt %d/%d failed (%s)",
                     event.event_id,
+                    event.vehicle_id,
                     attempt,
                     self._max_attempts,
                     type(exc).__name__,
@@ -264,21 +292,33 @@ class GpsConsumerService:
             # redelivery instead of being silently treated as a duplicate.
             await self._deduplicator.mark(event.event_id)
             self.stats.processed += 1
+            if handler_result is not None:
+                if handler_result.outcome is GpsHandlerOutcome.APPLIED:
+                    self.stats.applied += 1
+                elif handler_result.outcome is GpsHandlerOutcome.DUPLICATE:
+                    self.stats.location_duplicates += 1
+                elif handler_result.outcome is GpsHandlerOutcome.STALE:
+                    self.stats.stale += 1
             logger.debug(
-                "Processed GPS event %s at %s[%d]@%d",
+                "Processed GPS event %s for vehicle %s at %s[%d]@%d (%s)",
                 event.event_id,
+                event.vehicle_id,
                 message.topic,
                 message.partition,
                 message.offset,
+                handler_result.outcome if handler_result is not None else "processed",
             )
             return ConsumeResult(GpsConsumeOutcome.PROCESSED, event.event_id)
 
         if last_error is None:  # pragma: no cover - loop always runs once
             raise GpsConsumerError("GPS event handler produced no result")
 
+        failure_kind = (
+            last_error.failure_kind if isinstance(last_error, GpsHandlerError) else "handler"
+        )
         await self._quarantine(
             message,
-            error_type="handler_error",
+            error_type=f"{failure_kind}_error",
             error_message=f"{type(last_error).__name__}: {last_error}",
             event_id=event.event_id,
         )
@@ -315,7 +355,7 @@ class GpsConsumerService:
             ) from exc
 
         self.stats.quarantined += 1
-        if error_type != "handler_error":
+        if error_type in {"invalid_json", "invalid_schema"}:
             self.stats.invalid += 1
         logger.warning(
             "Quarantined message at %s[%d]@%d (%s)",

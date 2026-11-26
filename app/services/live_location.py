@@ -5,9 +5,9 @@ the Redis write model, validates caller arguments and calculates freshness. It
 never touches Redis keys or Lua directly; that belongs to
 :mod:`app.repositories.live_location`.
 
-Kafka consumer integration is intentionally **not** implemented in this
-milestone. A future handler can call :meth:`LiveLocationService.update_from_event`
-without changing the repository contract.
+The standalone GPS worker reaches this service through
+:class:`~app.services.live_location_handler.LiveLocationGpsEventHandler`, which
+keeps Kafka retry/DLQ decisions in the consumer pipeline.
 """
 
 import logging

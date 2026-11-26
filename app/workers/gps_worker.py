@@ -24,12 +24,15 @@ from app.infrastructure.kafka_consumer import (
     KafkaDeadLetterPublisher,
     KafkaGpsConsumer,
 )
+from app.infrastructure.redis import RedisClient, RedisUnavailableError
+from app.repositories.live_location import LiveLocationRepository
 from app.services.gps_consumer import (
     GpsConsumerError,
     GpsConsumerService,
     InMemoryEventDeduplicator,
-    LoggingGpsEventHandler,
 )
+from app.services.live_location import LiveLocationService
+from app.services.live_location_handler import LiveLocationGpsEventHandler
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +102,18 @@ def _install_shutdown_handlers(stop_event: asyncio.Event) -> Callable[[], None]:
 
 def build_worker(
     settings: Settings,
-) -> tuple[KafkaGpsConsumer, KafkaDeadLetterPublisher, GpsConsumerService]:
-    """Wire the transport, dead-letter publisher and processing service."""
+) -> tuple[
+    KafkaGpsConsumer,
+    KafkaDeadLetterPublisher,
+    GpsConsumerService,
+    RedisClient,
+]:
+    """Wire Kafka transport, Redis live state and the processing service.
+
+    Exactly one ``RedisClient`` and one connection pool are created for the
+    worker process. The client is returned so the worker can start (ping) and
+    close it independently of the FastAPI lifespan.
+    """
     dead_letters = KafkaDeadLetterPublisher(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         topic=settings.kafka_gps_dlq_topic,
@@ -108,8 +121,16 @@ def build_worker(
         replication_factor=settings.kafka_gps_replication_factor,
         delivery_timeout_seconds=settings.kafka_delivery_timeout_seconds,
     )
+    redis_client = RedisClient(settings)
+    live_location = LiveLocationService(
+        LiveLocationRepository(
+            redis_client.client,
+            prefix=settings.redis_key_prefix,
+        ),
+        stale_after_seconds=settings.redis_location_stale_after_seconds,
+    )
     service = GpsConsumerService(
-        handler=LoggingGpsEventHandler(),
+        handler=LiveLocationGpsEventHandler(live_location),
         dead_letter_publisher=dead_letters,
         deduplicator=InMemoryEventDeduplicator(),
         max_attempts=settings.kafka_max_processing_attempts,
@@ -124,11 +145,11 @@ def build_worker(
         poll_timeout_seconds=settings.kafka_consumer_poll_timeout_seconds,
         service=service,
     )
-    return consumer, dead_letters, service
+    return consumer, dead_letters, service, redis_client
 
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
-    consumer, dead_letters, service = build_worker(settings)
+    consumer, dead_letters, service, redis_client = build_worker(settings)
     stop_event = asyncio.Event()
     restore_handlers = _install_shutdown_handlers(stop_event)
 
@@ -138,26 +159,38 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         duration_timer = loop.call_later(args.duration_seconds, stop_event.set)
 
     logger.info(
-        "GPS worker starting: topic=%s group=%s dlq=%s attempts=%d",
+        "GPS worker starting: topic=%s group=%s dlq=%s attempts=%d redis_prefix=%s",
         settings.kafka_gps_topic,
         settings.kafka_consumer_group_id,
         settings.kafka_gps_dlq_topic,
         settings.kafka_max_processing_attempts,
+        settings.redis_key_prefix,
     )
 
     exit_code = 0
     try:
+        # Redis must be ready before the first record is fetched: a missing
+        # live-state store is a startup failure, not a per-message surprise.
+        await redis_client.start()
         await dead_letters.start()
         await consumer.start()
         await consumer.run(stop_event)
     except GpsConsumerError as exc:
         logger.error("GPS worker stopped after a failure: %s", exc)
         exit_code = 1
+    except RedisUnavailableError as exc:
+        logger.error(
+            "GPS worker cannot start because Redis is unavailable (%s); "
+            "verify REDIS_URL and 'docker compose up -d redis'",
+            type(exc).__name__,
+        )
+        exit_code = 1
     finally:
         if duration_timer is not None:
             duration_timer.cancel()
         await consumer.stop()
         await dead_letters.close()
+        await redis_client.close()
         restore_handlers()
         logger.info("GPS worker finished: %s", service.stats.summary())
 
@@ -172,6 +205,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not settings.kafka_enabled:
         logger.error("KAFKA_ENABLED=false: the GPS consumer worker requires Kafka")
+        return 1
+    if not settings.redis_enabled:
+        logger.error("REDIS_ENABLED=false: the GPS consumer worker requires Redis")
         return 1
 
     try:

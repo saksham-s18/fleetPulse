@@ -11,8 +11,8 @@ only see an injected ``redis.asyncio.Redis`` instance:
 - application-level exceptions that never carry the Redis URL or credentials.
 
 The :class:`RedisClient` wrapper is intentionally independent from FastAPI so
-the future Kafka worker (Milestone 6.2) can create and close the same client
-without importing the web layer.
+the standalone GPS worker can create and close the same client without
+importing the web layer.
 """
 
 import logging

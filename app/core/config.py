@@ -63,8 +63,8 @@ class Settings(BaseSettings):
 
     # Redis stores the live vehicle-location projection (latest location plus
     # a GEO index). The URL is a SecretStr so a password never appears in
-    # reprs or logs. Redis is not used by the Kafka consumer yet (Milestone
-    # 6.2); the API only owns the client lifecycle for future use.
+    # reprs or logs. The API and the standalone GPS worker each own one client
+    # lifecycle; the worker requires Redis and fails startup without it.
     redis_enabled: bool = True
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
     redis_connect_timeout_seconds: float = Field(default=2.0, gt=0)

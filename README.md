@@ -1,7 +1,7 @@
 # FleetPulse
 
 FleetPulse is a Real-Time Fleet and Delivery Intelligence Platform. The
-repository currently contains nine milestones:
+repository currently contains ten milestones:
 
 - **Milestone 1** — modular FastAPI application, Pydantic Settings, structured
   logging, health probes and a tested toolchain.
@@ -23,8 +23,11 @@ repository currently contains nine milestones:
   in-memory deduplication, bounded retries and an explicit dead-letter topic.
 - **Milestone 6.1** — Redis infrastructure and a live-location projection:
   shared async client lifecycle, namespaced latest-location hashes, a GEO
-  index and an atomic out-of-order/idempotency contract. Kafka
-  consumer-to-Redis integration is deliberately left to Milestone 6.2.
+  index and an atomic out-of-order/idempotency contract.
+- **Milestone 6.2** — Kafka consumer-to-Redis integration: every successfully
+  consumed GPS event updates the live-location hash and GEO index through the
+  existing `LiveLocationService`, with explicit applied/duplicate/stale
+  handling and Redis failures routed through the existing retry/DLQ policy.
 
 Authentication, durable GPS persistence, location REST endpoints and
 Kubernetes manifests remain intentionally out of scope.
@@ -120,6 +123,7 @@ fleetpulse/
 |   |   |-- gps_consumer.py      # Dedup, retries and quarantine pipeline
 |   |   |-- gps_publisher.py     # GpsEventPublisher protocol and errors
 |   |   |-- live_location.py     # Validation, mapping and staleness
+|   |   |-- live_location_handler.py # GPS event → Redis projection handler
 |   |   |-- pagination.py
 |   |   |-- shipment.py
 |   |   |-- shipment_transitions.py
@@ -137,8 +141,10 @@ fleetpulse/
 |   |-- test_database.py         # Unit tests (no PostgreSQL required)
 |   |-- test_gps_ingestion_api.py # GPS endpoint wiring (no PostgreSQL)
 |   |-- test_gps_consumer_service.py # Dedup, retries and quarantine logic
+|   |-- test_gps_live_location_handler.py # Consumer→Redis outcomes and failures
 |   |-- test_gps_publish_service.py # Publish ordering and 503 mapping
 |   |-- test_gps_schema.py       # GPS contract validation tests
+|   |-- test_gps_worker_redis.py # Worker Redis/Kafka lifecycle (no broker)
 |   |-- test_health.py           # Unit tests (no PostgreSQL required)
 |   |-- test_integrity_errors.py # Constraint translation tests
 |   |-- test_kafka_consumer_infra.py # Offset commits and DLQ envelopes (mocked)
@@ -157,6 +163,7 @@ fleetpulse/
 |       |-- test_database.py     # Real PostgreSQL integration tests
 |       |-- test_gps_ingestion.py # GPS ingestion rules against PostgreSQL
 |       |-- test_gps_consumer_kafka.py # Consumer, offsets and DLQ (marked kafka)
+|       |-- test_gps_consumer_redis.py # Consumer→Redis flow (marked kafka_redis)
 |       |-- test_gps_kafka_broker.py # Real broker round trip (marked kafka)
 |       |-- test_gps_publish_api.py  # 202/503 publication semantics
 |       |-- test_live_location_redis.py # Real Redis hashes, GEO and atomic updates
@@ -213,7 +220,7 @@ logs and representations.
 | `KAFKA_MAX_PROCESSING_ATTEMPTS` | `3`                                                  | Handler attempts before dead-lettering     |
 | `KAFKA_RETRY_DELAY_SECONDS` | `1.0`                                                   | Delay between handler attempts             |
 | `KAFKA_CONSUMER_POLL_TIMEOUT_SECONDS` | `1.0`                                          | Blocking time per poll when no records arrive |
-| `REDIS_ENABLED`            | `true`                                                   | Ping Redis at startup; `false` runs without Redis (unit tests) |
+| `REDIS_ENABLED`            | `true`                                                   | API pings Redis at startup; the GPS worker always requires Redis and rejects `false` |
 | `REDIS_PORT`               | `6379`                                                   | Host port mapped to the Redis container (Compose only) |
 | `REDIS_URL`                | `redis://localhost:6379/0`                               | Async Redis URL; stored as `SecretStr`      |
 | `REDIS_CONNECT_TIMEOUT_SECONDS` | `2`                                                  | TCP connect timeout                         |
@@ -618,8 +625,9 @@ event is stored in PostgreSQL. No GPS table or outbox exists yet
 
 Kafka is the hand-off point between the HTTP API and the processing stages of
 the platform: the API validates a GPS event and streams it into `gps.events`,
-and the standalone worker consumes that topic. Geofencing, alerts and durable
-storage belong to later milestones; the worker currently logs processed events.
+and the standalone worker consumes that topic and projects each handled event
+into Redis live state. Geofencing, alerts, location APIs and durable GPS
+storage belong to later milestones.
 
 ### Topic design
 
@@ -669,7 +677,8 @@ exits non-zero); requests are not retried, buffered or queued by the API.
 
 ### Current limitations
 
-- The worker logs processed events and updates in-memory counters only.
+- The worker projects handled events into Redis and updates in-memory counters;
+  it does not persist GPS events in PostgreSQL.
 - GPS events are not persisted in PostgreSQL; `persisted` is always `false`.
 - If the delivery timeout elapses, the API answers `503` (delivery not
   confirmed). The producer may still deliver that event once the broker
@@ -683,16 +692,15 @@ exits non-zero); requests are not retried, buffered or queued by the API.
 ## Kafka GPS consumer worker
 
 The consumer is an **independent process**, never started by the FastAPI
-lifespan:
+lifespan. Since Milestone 6.2 it also requires Redis:
 
 ```powershell
-docker compose up -d postgres kafka     # infrastructure only
-python -m app.workers.gps_worker        # consumes until Ctrl+C / SIGTERM
+docker compose up -d kafka redis         # worker infrastructure
+python -m app.workers.gps_worker         # consumes until Ctrl+C / SIGTERM
 ```
 
-The worker does not touch PostgreSQL or Redis yet. To exercise the whole
-pipeline, run the API (`uvicorn app.main:app`) and the simulator in two more
-terminals while the worker runs. Useful options:
+For the complete API → Kafka → worker → Redis flow, also start PostgreSQL and
+the API (`uvicorn app.main:app`) plus the simulator. Useful options:
 
 | Option              | Default | Purpose                                          |
 | ------------------- | ------- | ------------------------------------------------ |
@@ -702,9 +710,37 @@ terminals while the worker runs. Useful options:
 Architecture: `app/infrastructure/kafka_consumer.py` owns fetching, manual
 offset commits and the DLQ producer; `app/services/gps_consumer.py` owns
 validation, deduplication, retries and the handler boundary;
-`app/workers/gps_worker.py` wires them together and handles signals. The
-default handler (`LoggingGpsEventHandler`) only logs; future milestones replace
-it with Redis/PostgreSQL projections without changing Kafka code.
+`app/services/live_location_handler.py` maps one validated event onto
+`LiveLocationService.update_from_event`; `app/workers/gps_worker.py` wires the
+transport, Redis client and handler together and handles signals. The worker
+creates exactly one `RedisClient`/connection pool per process, pings it during
+startup, and closes it on shutdown independently of the FastAPI lifespan. A
+missing Redis is a startup failure (exit code `1`), not a per-message surprise.
+
+### Event processing and Redis outcomes
+
+For each validated event the worker:
+
+1. checks the bounded in-memory deduplicator;
+2. calls `LiveLocationService`, whose repository runs the atomic Redis Lua
+   compare-and-set for the location hash and GEO index;
+3. marks the event as processed only after Redis reports success;
+4. lets the Kafka transport commit `record.offset + 1` afterwards.
+
+| Result | Meaning | Kafka offset |
+| ------ | ------- | ------------ |
+| `applied` | A strictly newer observation was written to hash + GEO | Committed |
+| `duplicate` (Redis) | The same `event_id` is already stored; nothing is written | Committed |
+| `stale` | A newer `(recorded_at, event_id)` is already stored; nothing is written | Committed |
+| `duplicate` (in-memory) | The event ID is still in the process-local deduplicator; handler is skipped | Committed |
+| `redis_error` | Redis was unreachable, timed out or rejected the write (including OOM) | Not committed; retried, then DLQ |
+
+Redis failures are translated to the retryable `GpsHandlerError` with
+`failure_kind="redis"`; they are never classified as invalid GPS payloads.
+They do not mark the event processed, do not commit the offset and do not
+overwrite live state. If the bounded retry budget is exhausted, the original
+payload is quarantined with `error.type="redis_error"`; the offset advances
+only after the DLQ broker acknowledgement.
 
 ### Consumer group and ordering
 
@@ -722,50 +758,64 @@ it with Redis/PostgreSQL projections without changing Kafka code.
 
 - Automatic commits are disabled (`enable_auto_commit=False`). The worker
   commits `record.offset + 1` for the record's partition only after the service
-  reports success, a duplicate, or a dead-letter acknowledgement.
-- A failed handler or a failed DLQ publication never commits: the worker logs
-  the failure, exits non-zero, and Kafka redelivers the message on restart.
+  reports success, an in-memory duplicate, or a dead-letter acknowledgement.
+- A failed Redis update or a failed DLQ publication never commits: the worker
+  logs the failure, exits non-zero after retries are exhausted, and Kafka
+  redelivers the message on restart.
 - Processing is therefore **at-least-once**, not exactly-once. A crash between
-  handling and committing replays the event; deduplication suppresses the
-  duplicate handler run when the event ID is still remembered.
+  the Redis write and the offset commit replays the event. The in-memory
+  deduplicator may suppress it, but after a restart the atomic Redis
+  compare-and-set is the final protection: the repeated event is reported as a
+  duplicate, the position does not regress, and the offset can be committed.
 
 ### In-memory deduplication (non-durable)
 
 - `InMemoryEventDeduplicator` tracks `event_id` values in a bounded FIFO
   (default 100,000) behind the replaceable `EventDeduplicator` protocol.
-- An ID is marked **only after** the handler succeeds, so a failed event is
-  retried on redelivery instead of being skipped.
+- An ID is marked **only after** the handler succeeds, so a failed Redis write
+  is retried on redelivery instead of being skipped.
 - The state is process-local: it does **not** survive worker restarts and is
   **not** shared between instances. After a restart (or FIFO eviction) a
-  redelivered event is processed again. Redis/PostgreSQL deduplication is
-  intentionally out of scope.
+  redelivered event reaches Redis again. Redis/PostgreSQL deduplication is
+  intentionally out of scope because the atomic update already makes the
+  projection idempotent per event.
 
 ### Retries and dead-letter handling
 
 - Invalid JSON, an empty value, or a payload that fails `GpsEvent` validation
   is quarantined immediately (no handler call, no silent discard).
-- Handler failures are retried up to `KAFKA_MAX_PROCESSING_ATTEMPTS`
-  (default `3`) with `KAFKA_RETRY_DELAY_SECONDS` (default `1.0`). Exhausted
-  attempts are quarantined.
+- Handler failures, including Redis unavailability, timeouts and rejected
+  writes, are retried up to `KAFKA_MAX_PROCESSING_ATTEMPTS` (default `3`) with
+  `KAFKA_RETRY_DELAY_SECONDS` (default `1.0`). Exhausted attempts are
+  quarantined.
 - Quarantine publishes to `KAFKA_GPS_DLQ_TOPIC` (default `gps.events.dlq`) and
   waits for the broker acknowledgement **before** the original offset is
   committed. If the DLQ publish fails, nothing is committed.
 - The DLQ envelope carries `original_topic`, `original_partition`,
   `original_offset`, `original_timestamp_ms`, the original key (also used as
   the DLQ message key), `event_id` when known, the raw payload as UTF-8 or
-  base64 (`payload_encoding`), and `error: {type, message}`. Messages are
-  truncated to keep metadata bounded; no credentials are logged.
+  base64 (`payload_encoding`), and `error: {type, message}`. Redis failures use
+  `error.type="redis_error"`; messages stay log-safe and never include the
+  Redis URL or credentials.
+
+### Statistics and logging
+
+The worker summary distinguishes `received`, `processed`, `applied`,
+`duplicates` (in-memory), `location_duplicates` (Redis), `stale`, `invalid`,
+`handler_failures`, `redis_failures`, `retries` and `quarantined`. Logs include
+the event ID and vehicle ID for handler outcomes; full GPS payloads are not
+logged. Prometheus metrics are intentionally deferred to a later milestone.
 
 ### Shutdown and logging
 
 `SIGINT` and `SIGTERM` set a stop event: the worker stops fetching, finishes
-and commits the record in flight, closes the consumer and DLQ producer, and
-logs received/processed/duplicate/invalid/failure/retry/quarantined counts.
-No consumer runs inside the API process, and the worker is not a Compose
-service because the repository has no application image (Compose contains only
-PostgreSQL and Kafka; API, simulator and worker run on the host).
+and commits the record in flight, closes the consumer, DLQ producer and Redis
+client, and logs the counter summary. No consumer runs inside the API process,
+and the worker is not a Compose service because the repository has no
+application image (Compose provides PostgreSQL, Kafka and Redis; API, simulator
+and worker run on the host).
 
-## Redis live-location projection (Milestone 6.1)
+## Redis live-location projection (Milestones 6.1 and 6.2)
 
 Redis stores the current position of every reporting vehicle so later
 milestones can answer "where is it now?" and "what is nearby?" without
@@ -773,11 +823,10 @@ scanning PostgreSQL. It is a **rebuildable projection**: PostgreSQL remains
 the durable domain store and Kafka remains the event log. Redis is not the
 source of truth.
 
-**Milestone 6.1 does not connect the Kafka consumer to Redis.** The
-repository and service exist and are fully tested, but `gps_consumer.py` and
-`app/workers/gps_worker.py` still use the logging handler. Wiring the consumer
-to `LiveLocationService.update_from_event` belongs to Milestone 6.2, as do
-location REST endpoints.
+Milestone 6.1 introduced the repository, service and atomic update contract.
+Milestone 6.2 connects the standalone Kafka worker to
+`LiveLocationService.update_from_event`; no REST location endpoint or
+PostgreSQL GPS persistence exists yet.
 
 ### Key naming and data structures
 
@@ -850,13 +899,14 @@ queryable so an operator can see where a silent vehicle was last seen.
 `app/infrastructure/redis.py` owns one async `redis.asyncio.Redis` client and
 one bounded connection pool per process. The FastAPI lifespan creates it,
 pings it when `REDIS_ENABLED=true`, stores it on `app.state.redis_client` and
-closes it during shutdown. `get_redis_client` and `get_live_location_service`
-in `app/api/dependencies.py` inject the shared client; no connection is
-created per request or per GPS event. Startup fails loudly (without exposing
-the URL) when Redis is required but unreachable. The `RedisClient` wrapper has
-no FastAPI dependency, so the future Kafka worker can create and close the
-same client independently. Unit tests set `REDIS_ENABLED=false` and never
-require a Redis server.
+closes it during shutdown. The standalone GPS worker creates its own
+`RedisClient` during startup, pings it, and closes it during shutdown; it does
+not depend on the FastAPI lifespan. `get_redis_client` and
+`get_live_location_service` in `app/api/dependencies.py` inject the shared API
+client. No connection is created per request, per message or per GPS event.
+Startup fails loudly (without exposing the URL) when Redis is required but
+unreachable. Unit tests set `REDIS_ENABLED=false` and never require a Redis
+server.
 
 ### Redis persistence and recovery
 
@@ -872,8 +922,8 @@ state. Those mechanisms are not a durability guarantee:
 - Kafka currently retains GPS events according to broker defaults, which are
   not configured for indefinite replay. Redis cannot be guaranteed fully
   reconstructible until retention is explicitly sized for the rebuild window.
-- No replay/rebuild worker exists yet, and the consumer is not integrated with
-  Redis in this milestone.
+- No replay/rebuild worker exists yet. The live consumer projects new events
+  into Redis, but there is no operational rebuild command or runbook.
 
 A future rebuild process would clear the configured namespace, reset or seek
 the consumer group to the earliest retained offset and replay `gps.events`
@@ -911,18 +961,20 @@ but cannot reach PostgreSQL. Database errors are not exposed in the response.
 
 Unit tests do not require PostgreSQL, Kafka or Redis. The suite sets
 `KAFKA_ENABLED=false` and `REDIS_ENABLED=false` (see `tests/conftest.py`), and
-the default selection excludes the `integration`, `kafka` and `redis` markers:
+the default selection excludes the `integration`, `kafka`, `redis` and
+`kafka_redis` markers:
 
 ```powershell
 pytest
 ```
 
 The GPS contract, GPS endpoint wiring, GPS publisher, producer lifecycle,
-consumer processing, consumer transport, Redis live-location and simulator
-tests are unit tests and need no infrastructure:
+consumer processing, consumer transport, Redis live-location, consumer→Redis
+handler, worker lifecycle and simulator tests are unit tests and need no
+infrastructure:
 
 ```powershell
-pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_kafka_consumer_infra.py tests/test_live_location.py tests/test_redis_infrastructure.py tests/test_lifespan_redis.py tests/test_simulator.py
+pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_gps_live_location_handler.py tests/test_gps_worker_redis.py tests/test_kafka_consumer_infra.py tests/test_live_location.py tests/test_redis_infrastructure.py tests/test_lifespan_redis.py tests/test_simulator.py
 ```
 
 They cover valid and invalid events, coordinate and heading boundaries, naive
@@ -931,12 +983,15 @@ configuration (`acks=all`, idempotence, JSON payload, `vehicle_id` key, topic
 creation), publish ordering and failure mapping, consumer JSON/schema
 validation, in-memory deduplication (including not marking failures), bounded
 retries, dead-letter envelopes, manual offset commits and commit ordering,
-graceful shutdown, Redis key namespacing, hash serialisation, atomic updates,
-duplicate and out-of-order handling, GEO lookups, staleness, Redis error
-translation, the Redis lifespan, deterministic event generation, seed
-reproducibility, route interpolation, unique event IDs, HTTP payloads, HTTP
-publisher success/failure reporting and simulator shutdown. The live-location
-unit tests use `fakeredis` (including Lua) and never need a server.
+graceful shutdown, applied/duplicate/stale Redis outcomes, Redis connection,
+timeout and OOM failures becoming retryable errors, Redis failure leaving the
+offset uncommitted, worker Redis initialization/closure, Redis key namespacing,
+hash serialisation, atomic updates, duplicate and out-of-order handling, GEO
+lookups, staleness, Redis error translation, the Redis lifespan, deterministic
+event generation, seed reproducibility, route interpolation, unique event IDs,
+HTTP payloads, HTTP publisher success/failure reporting and simulator shutdown.
+The live-location unit tests use `fakeredis` (including Lua) and never need a
+server.
 
 Integration tests require the Docker PostgreSQL service with migrations
 applied, and are marked `integration`; they fail (not skip) if PostgreSQL is
@@ -975,6 +1030,18 @@ and deletes its keys:
 ```powershell
 docker compose up -d redis
 pytest -m redis
+```
+
+End-to-end consumer→Redis tests are marked `kafka_redis` and need **both**
+services. They publish through the existing producer, run the real worker
+components, verify the Redis hash and GEO index, cover newer/older/duplicate
+delivery, and prove that a Redis outage leaves the Kafka offset uncommitted
+until the event is safely dead-lettered. Each test uses an isolated topic, DLQ,
+consumer group and key namespace:
+
+```powershell
+docker compose up -d kafka redis
+pytest -m kafka_redis
 ```
 
 For safe migration verification, use a dedicated test database rather than one
@@ -1069,18 +1136,21 @@ GPS producer failed to start", the broker was unreachable when the API booted.
 
 **The GPS worker exits immediately or logs fetch failures**
 
-The worker requires Kafka even when the API runs with `KAFKA_ENABLED=false`.
-Start the broker and verify connectivity:
+The worker requires Kafka **and** Redis even when the API runs with
+`KAFKA_ENABLED=false`/`REDIS_ENABLED=false`. Start both services and verify
+connectivity:
 
 ```powershell
-docker compose ps kafka
+docker compose ps kafka redis
 python -m app.workers.gps_worker --log-level DEBUG
 ```
 
-Confirm `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_CONSUMER_GROUP_ID` and
-`KAFKA_GPS_TOPIC` match the running broker. If the worker reports that a message
-could not be dead-lettered, check `KAFKA_GPS_DLQ_TOPIC`; the original offset is
-intentionally left uncommitted until the DLQ acknowledges it.
+Confirm `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_CONSUMER_GROUP_ID`,
+`KAFKA_GPS_TOPIC` and `REDIS_URL` match the running services. If startup fails
+with "Redis is unavailable", the worker exits with code `1` before fetching.
+If the worker reports that a message could not be dead-lettered, check
+`KAFKA_GPS_DLQ_TOPIC`; the original offset is intentionally left uncommitted
+until the DLQ acknowledges it.
 
 **The API fails at startup with "Redis is required"**
 
@@ -1103,16 +1173,18 @@ credentials.
 - Do not commit credentials or other secrets. Supply them through environment
   variables only.
 - The database engine and Redis client are each created once per application
-  process and disposed during FastAPI shutdown.
+  process and disposed during FastAPI shutdown. The standalone GPS worker owns
+  a separate Redis client and closes it on shutdown.
 - Authentication, durable GPS persistence, location REST endpoints and
   Kubernetes remain out of scope. Milestones 5A–5C.2 provide the GPS event
   contract, a simulator, an HTTP ingestion endpoint, a Kafka producer and a
-  standalone consumer worker: events are validated, published to `gps.events`,
-  consumed at-least-once and logged, but no GPS rows are stored, so `persisted`
-  is always `false` in ingestion responses. The worker's deduplication is
+  standalone consumer worker: events are validated, published to `gps.events`
+  and consumed at-least-once, but no GPS rows are stored, so `persisted` is
+  always `false` in ingestion responses. The worker's deduplication is
   in-memory only.
-- Milestone 6.1 adds the Redis client, live-location repository and service.
-  **The Kafka consumer is not connected to Redis yet**; no location endpoint is
-  exposed. Redis holds a rebuildable projection and is not the source of truth.
+- Milestone 6.1 adds the Redis client, live-location repository and service;
+  Milestone 6.2 connects the Kafka consumer to that service. No location REST
+  endpoint is exposed yet. Redis holds a rebuildable projection and is not the
+  source of truth.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.

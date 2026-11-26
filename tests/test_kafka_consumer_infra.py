@@ -10,6 +10,7 @@ import base64
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from uuid import uuid4
@@ -22,12 +23,15 @@ from app.infrastructure.kafka_consumer import (
     KafkaDeadLetterPublisher,
     KafkaGpsConsumer,
 )
+from app.schemas.gps import GpsEvent
 from app.services.gps_consumer import (
     ConsumeResult,
     DeadLetterPublishError,
     DeadLetterRecord,
     GpsConsumeOutcome,
     GpsConsumerError,
+    GpsConsumerService,
+    GpsHandlerError,
     GpsMessage,
 )
 
@@ -142,6 +146,21 @@ class FakeProducer:
         self.sent.append({"topic": topic, "value": value, "key": key})
 
 
+class RedisFailingHandler:
+    """Raise the retryable Redis failure kind used by the live-location handler."""
+
+    async def handle(self, event: GpsEvent) -> None:
+        del event
+        raise GpsHandlerError("live-location update is unavailable", failure_kind="redis")
+
+
+class FailingDeadLetters:
+    """Reject every quarantine attempt to exercise the no-commit path."""
+
+    async def publish(self, record: DeadLetterRecord) -> None:
+        raise DeadLetterPublishError(f"cannot quarantine offset {record.offset}")
+
+
 class FakeService:
     """Stand-in for GpsConsumerService with a fixed outcome or error."""
 
@@ -209,6 +228,22 @@ def make_record(
         key=key,
         value=value,
     )
+
+
+def valid_event_bytes() -> bytes:
+    """Return one schema-valid GPS payload for service-level tests."""
+    event = GpsEvent.model_validate(
+        {
+            "event_id": uuid4(),
+            "vehicle_id": uuid4(),
+            "latitude": 52.52,
+            "longitude": 13.405,
+            "speed_kmph": 31.5,
+            "heading": 87.5,
+            "recorded_at": datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        }
+    )
+    return json.dumps(event.model_dump(mode="json")).encode("utf-8")
 
 
 def make_dlq(**overrides: object) -> KafkaDeadLetterPublisher:
@@ -386,6 +421,29 @@ async def test_processing_failure_does_not_commit() -> None:
     with pytest.raises(GpsConsumerError, match="dead-lettered"):
         await consumer.run(stop_event)
 
+    assert FakeConsumer.instances[0].commit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_redis_failure_without_dlq_ack_does_not_commit_offset() -> None:
+    service = GpsConsumerService(
+        handler=RedisFailingHandler(),
+        dead_letter_publisher=FailingDeadLetters(),
+        max_attempts=2,
+        retry_delay_seconds=0,
+    )
+    consumer = make_consumer(service=service)  # type: ignore[arg-type]
+    await consumer.start()
+    stop_event = asyncio.Event()
+    partition = TopicPartition("gps.events", 1)
+    FakeConsumer.instances[0].batches.append({partition: [make_record(value=valid_event_bytes())]})
+    FakeConsumer.instances[0].on_getmany = stop_event.set
+
+    with pytest.raises(GpsConsumerError, match="dead-lettered"):
+        await consumer.run(stop_event)
+
+    assert service.stats.redis_failures == 2
+    assert service.stats.processed == 0
     assert FakeConsumer.instances[0].commit_calls == []
 
 
