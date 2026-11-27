@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 API_DESCRIPTION = (
     "FleetPulse is a real-time fleet and delivery intelligence platform. "
     "This milestone provides REST APIs and business logic for vehicles, "
-    "drivers, shipments and historical vehicle assignments."
+    "drivers, shipments and historical vehicle assignments, plus read APIs "
+    "for the Redis live-location projection."
 )
 
 

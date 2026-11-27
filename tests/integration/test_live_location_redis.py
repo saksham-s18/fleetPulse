@@ -22,7 +22,7 @@ from app.core.config import get_settings
 from app.infrastructure.redis import check_redis, create_redis_client, ensure_redis_ready
 from app.repositories.live_location import LiveLocationRepository
 from app.schemas.gps import GpsEvent
-from app.schemas.live_location import LocationUpdateOutcome
+from app.schemas.live_location import DistanceUnit, LocationUpdateOutcome
 from app.services.live_location import LiveLocationService
 
 pytestmark = pytest.mark.redis
@@ -226,3 +226,94 @@ async def test_repeated_updates_do_not_desynchronise_hash_and_geo(
     assert location is not None
     assert coordinates is not None
     assert coordinates == pytest.approx((location.latitude, location.longitude))
+
+
+@pytest.mark.asyncio
+async def test_paginated_locations_and_stale_filter(
+    redis_client: Redis,
+    namespace: str,
+) -> None:
+    service = build_service(redis_client, namespace)
+    fresh_events = [
+        make_event(latitude=52.50 + step / 100, longitude=13.40 + step / 100) for step in range(3)
+    ]
+    stale_event = make_event(
+        latitude=52.60,
+        longitude=13.50,
+        recorded_at=RECORDED_AT - timedelta(seconds=120),
+    )
+    for event in (*fresh_events, stale_event):
+        await service.update_from_event(event)
+
+    current = RECORDED_AT + timedelta(seconds=30)
+    first = await service.list_vehicle_locations(page=1, page_size=2, now=current)
+    second = await service.list_vehicle_locations(page=2, page_size=2, now=current)
+    assert first.total == 4
+    assert first.total_pages == 2
+    assert len(first.items) == 2
+    assert len(second.items) == 2
+    assert {item.vehicle_id for item in (*first.items, *second.items)} == {
+        event.vehicle_id for event in (*fresh_events, stale_event)
+    }
+
+    stale_page = await service.list_vehicle_locations(is_stale=True, now=current)
+    assert stale_page.total == 1
+    assert [item.vehicle_id for item in stale_page.items] == [stale_event.vehicle_id]
+
+    fresh_page = await service.list_vehicle_locations(is_stale=False, now=current)
+    assert fresh_page.total == 3
+    assert {item.vehicle_id for item in fresh_page.items} == {
+        event.vehicle_id for event in fresh_events
+    }
+
+
+@pytest.mark.asyncio
+async def test_nearby_records_and_empty_results(
+    redis_client: Redis,
+    namespace: str,
+) -> None:
+    service = build_service(redis_client, namespace)
+    repository = LiveLocationRepository(redis_client, prefix=namespace)
+    near = make_event(latitude=52.5200, longitude=13.4050)
+    farther = make_event(latitude=52.5300, longitude=13.4150)
+    for event in (near, farther):
+        await service.update_from_event(event)
+
+    entries = await repository.nearby_records(52.5200, 13.4050, radius_km=5, limit=10)
+    assert [entry.location.vehicle_id for entry in entries] == [
+        near.vehicle_id,
+        farther.vehicle_id,
+    ]
+    assert entries[0].distance_km <= entries[1].distance_km
+
+    result = await service.find_nearby_vehicles(
+        52.5200,
+        13.4050,
+        5000,
+        unit=DistanceUnit.METERS,
+    )
+    assert len(result.items) == 2
+    assert result.items[0].distance == pytest.approx(0.0, abs=1.0)
+    assert result.items[1].distance > result.items[0].distance
+
+    empty = await service.find_nearby_vehicles(48.1372, 11.5756, 1)
+    assert empty.items == []
+
+    empty_page = await service.list_vehicle_locations(
+        vehicle_id=uuid4(),
+        now=RECORDED_AT,
+    )
+    assert empty_page.total == 0
+    assert empty_page.items == []
+
+
+@pytest.mark.asyncio
+async def test_location_hash_retrieval_missing_vehicle(
+    redis_client: Redis,
+    namespace: str,
+) -> None:
+    repository = LiveLocationRepository(redis_client, prefix=namespace)
+
+    assert await repository.latest(uuid4()) is None
+    assert await repository.count_indexed() == 0
+    assert await repository.page_indexed(offset=0, limit=10) == []

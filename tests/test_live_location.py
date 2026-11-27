@@ -392,3 +392,73 @@ async def test_service_validates_query_arguments(service: LiveLocationService) -
         LiveLocationService(
             LiveLocationRepository(cast(Redis, BrokenRedis())), stale_after_seconds=0
         )
+
+
+@pytest.mark.asyncio
+async def test_repository_pages_and_scans_the_geo_index(
+    repository: LiveLocationRepository,
+) -> None:
+    events = [
+        make_event(latitude=52.50 + step / 100, longitude=13.40 + step / 100) for step in range(5)
+    ]
+    for event in events:
+        await repository.apply(make_write(event))
+
+    assert await repository.count_indexed() == 5
+    first_page = await repository.page_indexed(offset=0, limit=2)
+    second_page = await repository.page_indexed(offset=2, limit=2)
+    assert len(first_page) == 2
+    assert len(second_page) == 2
+    assert {record.vehicle_id for record in first_page}.isdisjoint(
+        {record.vehicle_id for record in second_page}
+    )
+
+    scanned = []
+    async for batch in repository.scan_indexed(batch_size=2):
+        assert len(batch) <= 2
+        scanned.extend(batch)
+    assert {record.vehicle_id for record in scanned} == {event.vehicle_id for event in events}
+
+
+@pytest.mark.asyncio
+async def test_repository_nearby_records_include_hashes_and_distances(
+    repository: LiveLocationRepository,
+) -> None:
+    near = make_event(latitude=52.5200, longitude=13.4050)
+    farther = make_event(latitude=52.5300, longitude=13.4150)
+    await repository.apply(make_write(near))
+    await repository.apply(make_write(farther))
+
+    entries = await repository.nearby_records(52.5200, 13.4050, radius_km=5, limit=10)
+
+    assert [entry.location.vehicle_id for entry in entries] == [
+        near.vehicle_id,
+        farther.vehicle_id,
+    ]
+    assert entries[0].distance_km <= entries[1].distance_km
+    assert entries[0].location.event_id == near.event_id
+
+
+@pytest.mark.asyncio
+async def test_repository_skips_malformed_hashes_in_pages(
+    repository: LiveLocationRepository,
+    redis_client: fakeredis.aioredis.FakeRedis,
+) -> None:
+    valid = make_event()
+    await repository.apply(make_write(valid))
+    broken_vehicle = uuid4()
+    await cast(
+        Awaitable[int],
+        redis_client.hset(
+            repository.keys.location(broken_vehicle),
+            mapping={"vehicle_id": str(broken_vehicle), "latitude": "not-a-number"},
+        ),
+    )
+    await redis_client.geoadd(
+        repository.keys.geo,
+        (13.4, 52.5, str(broken_vehicle)),
+    )
+
+    assert await repository.count_indexed() == 2
+    page = await repository.page_indexed(offset=0, limit=10)
+    assert [record.vehicle_id for record in page] == [valid.vehicle_id]

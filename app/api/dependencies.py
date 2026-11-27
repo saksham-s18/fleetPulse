@@ -68,6 +68,9 @@ def get_live_location_service(
     return LiveLocationService(
         repository,
         stale_after_seconds=settings.redis_location_stale_after_seconds,
+        max_page_size=settings.redis_location_max_page_size,
+        max_nearby_radius_km=settings.redis_location_nearby_max_radius_km,
+        max_nearby_limit=settings.redis_location_nearby_max_limit,
     )
 
 

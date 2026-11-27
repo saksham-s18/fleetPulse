@@ -34,6 +34,18 @@ class NotFoundError(FleetPulseError):
     code = "not_found"
 
 
+class InvalidQueryError(FleetPulseError):
+    """A query parameter is valid syntactically but outside configured limits.
+
+    Used for bounds that are runtime configuration (for example the maximum
+    nearby radius or page size) and therefore cannot be expressed as a static
+    FastAPI ``Query`` constraint.
+    """
+
+    status_code = 422
+    code = "validation_error"
+
+
 class ConflictError(FleetPulseError):
     """The request conflicts with current state or a uniqueness constraint."""
 

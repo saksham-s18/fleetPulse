@@ -28,8 +28,11 @@ repository currently contains ten milestones:
   consumed GPS event updates the live-location hash and GEO index through the
   existing `LiveLocationService`, with explicit applied/duplicate/stale
   handling and Redis failures routed through the existing retry/DLQ policy.
+- **Milestone 6.3** — live-location REST APIs: single-vehicle lookup,
+  deterministic pagination over the Redis GEO index, and nearby-vehicle
+  search with unit conversion and optional stale filtering.
 
-Authentication, durable GPS persistence, location REST endpoints and
+Authentication, durable GPS persistence, location history, geofencing and
 Kubernetes manifests remain intentionally out of scope.
 
 ## Technology stack
@@ -77,7 +80,7 @@ fleetpulse/
 |   |       |-- assignments.py   # Assignment endpoints and history
 |   |       |-- drivers.py       # Driver endpoints
 |   |       |-- health.py        # GET /health/live, GET /health/ready
-|   |       |-- locations.py     # POST /api/v1/locations (GPS ingestion)
+|   |       |-- locations.py     # GPS ingestion + live-location read endpoints
 |   |       |-- root.py          # GET /
 |   |       |-- shipments.py     # Shipment endpoints and transitions
 |   |       `-- vehicles.py      # Vehicle endpoints
@@ -152,6 +155,7 @@ fleetpulse/
 |   |-- test_lifespan_kafka.py   # Producer startup/shutdown lifecycle
 |   |-- test_lifespan_redis.py   # Redis client startup/shutdown lifecycle
 |   |-- test_live_location.py    # Live-location unit tests (fakeredis)
+|   |-- test_live_location_api.py # Read API tests (fakeredis, no server)
 |   |-- test_models.py           # Model metadata tests (no PostgreSQL required)
 |   |-- test_redis_infrastructure.py # Redis client configuration and readiness
 |   |-- test_schemas.py          # Request/response validation tests
@@ -166,7 +170,8 @@ fleetpulse/
 |       |-- test_gps_consumer_redis.py # Consumer→Redis flow (marked kafka_redis)
 |       |-- test_gps_kafka_broker.py # Real broker round trip (marked kafka)
 |       |-- test_gps_publish_api.py  # 202/503 publication semantics
-|       |-- test_live_location_redis.py # Real Redis hashes, GEO and atomic updates
+|       |-- test_live_location_redis.py # Real Redis hashes, GEO, paging and freshness
+|       |-- test_live_location_api_redis.py # Read API smoke tests against Redis
 |       `-- test_models.py       # Constraints and relationship tests
 |-- simulator/
 |   |-- __init__.py
@@ -228,6 +233,9 @@ logs and representations.
 | `REDIS_MAX_CONNECTIONS`    | `20`                                                     | Maximum size of the shared connection pool  |
 | `REDIS_KEY_PREFIX`         | `fleetpulse`                                             | Namespace for every live-location key        |
 | `REDIS_LOCATION_STALE_AFTER_SECONDS` | `60`                                            | Age after which a location is marked stale   |
+| `REDIS_LOCATION_MAX_PAGE_SIZE` | `100`                                                  | Maximum `page_size` for live-location lists  |
+| `REDIS_LOCATION_NEARBY_MAX_RADIUS_KM` | `100`                                             | Maximum nearby search radius in kilometres   |
+| `REDIS_LOCATION_NEARBY_MAX_LIMIT` | `500`                                                 | Maximum nearby result limit                  |
 
 OpenAPI documentation (`/docs`, `/redoc`, `/openapi.json`) is enabled only when
 `APP_ENV=development`.
@@ -521,6 +529,9 @@ All business endpoints are versioned under `/api/v1`. List endpoints accept
 | GET    | `/api/v1/drivers/{driver_id}/assignments` | Driver assignment history                    |
 | GET    | `/api/v1/shipments/{shipment_id}/assignments` | Shipment assignment history              |
 | POST   | `/api/v1/locations`                     | Publish a validated GPS event to Kafka    |
+| GET    | `/api/v1/locations`                     | List live locations; filter `is_stale`, `vehicle_id` |
+| GET    | `/api/v1/locations/{vehicle_id}`        | Get one vehicle's latest live location    |
+| GET    | `/api/v1/locations/nearby`              | Find vehicles near a point via Redis GEO  |
 
 Shipment status transitions are explicit:
 
@@ -815,7 +826,7 @@ and the worker is not a Compose service because the repository has no
 application image (Compose provides PostgreSQL, Kafka and Redis; API, simulator
 and worker run on the host).
 
-## Redis live-location projection (Milestones 6.1 and 6.2)
+## Redis live-location projection (Milestones 6.1–6.3)
 
 Redis stores the current position of every reporting vehicle so later
 milestones can answer "where is it now?" and "what is nearby?" without
@@ -825,8 +836,8 @@ source of truth.
 
 Milestone 6.1 introduced the repository, service and atomic update contract.
 Milestone 6.2 connects the standalone Kafka worker to
-`LiveLocationService.update_from_event`; no REST location endpoint or
-PostgreSQL GPS persistence exists yet.
+`LiveLocationService.update_from_event`. Milestone 6.3 adds the read endpoints
+documented above. PostgreSQL GPS persistence still does not exist.
 
 ### Key naming and data structures
 
@@ -932,6 +943,90 @@ through the same idempotent update contract. Because updates are ordered by
 on the same latest state. That worker, retention tuning and an operational
 rebuild runbook are later milestones; this milestone only documents the path.
 
+## Live-location read API (Milestone 6.3)
+
+Three read endpoints expose the Redis projection. They never query
+PostgreSQL for location data and never expose Redis keys, commands or
+connection details.
+
+| Method | Path                              | Purpose                                      |
+| ------ | --------------------------------- | -------------------------------------------- |
+| GET    | `/api/v1/locations/{vehicle_id}`  | Latest location for one vehicle              |
+| GET    | `/api/v1/locations`               | Paginated latest locations                   |
+| GET    | `/api/v1/locations/nearby`        | Vehicles within a radius, nearest first      |
+
+The single-vehicle and list responses contain `vehicle_id`, `event_id`,
+`latitude`, `longitude`, `speed_kmh`, `heading`, `recorded_at`, `received_at`,
+optional `shipment_id`, `is_stale` and non-negative `age_seconds`.
+
+```powershell
+# One vehicle
+curl.exe "http://127.0.0.1:8000/api/v1/locations/0b6f2c9a-1d2e-4f3a-8b7c-9d0e1f2a3b4c"
+
+# One page, optionally filtered by freshness or vehicle
+curl.exe "http://127.0.0.1:8000/api/v1/locations?page=1&page_size=20"
+curl.exe "http://127.0.0.1:8000/api/v1/locations?is_stale=true"
+curl.exe "http://127.0.0.1:8000/api/v1/locations?vehicle_id=0b6f2c9a-1d2e-4f3a-8b7c-9d0e1f2a3b4c"
+
+# Nearby: Berlin centre, 5 km, nearest 20
+curl.exe "http://127.0.0.1:8000/api/v1/locations/nearby?latitude=52.52&longitude=13.405&radius=5&unit=km&limit=20"
+```
+
+List responses use `items`, `page`, `page_size`, `total` and `total_pages`.
+`page` defaults to `1`; `page_size` defaults to `20` and is capped by
+`REDIS_LOCATION_MAX_PAGE_SIZE` (default `100`, hard API maximum `500`). Ordering
+is deterministic for a fixed dataset: members come from the existing
+`{prefix}:live:geo` sorted set in rank order (geohash score, then member). The
+unfiltered path reads only the requested page of hashes, in one pipeline, and
+uses `ZCARD` for `total`. Filtering by `is_stale` streams the whole GEO index in
+bounded batches because freshness lives in the hash; that path is `O(N)` and
+its `total` is the exact number of matches at scan time.
+
+The projection is live, not a snapshot. A GPS update can move a vehicle in the
+GEO rank or change the index size between page requests, so a client paginating
+slowly may see an item on two adjacent pages or miss one. `total` is an
+instantaneous count. Clients that need a stable view should request a larger
+page or retry the sequence.
+
+### Nearby search
+
+| Parameter       | Required | Default | Rules                                              |
+| --------------- | -------- | ------- | -------------------------------------------------- |
+| `latitude`      | yes      | —       | `-90` … `90`                                       |
+| `longitude`     | yes      | —       | `-180` … `180`                                     |
+| `radius`        | yes      | —       | Positive, in `unit`; at most `REDIS_LOCATION_NEARBY_MAX_RADIUS_KM` (default `100` km) |
+| `unit`          | no       | `km`    | `m`, `km` or `mi`                                  |
+| `limit`         | no       | `50`    | `1` … `REDIS_LOCATION_NEARBY_MAX_LIMIT` (default `500`) |
+| `exclude_stale` | no       | `false` | Drop stale vehicles from the candidate window      |
+
+The endpoint uses `GEOSEARCH ... BYRADIUS ... ASC` and fetches all matching
+hashes with one pipeline. The response echoes `center`, `radius` and `unit`, and
+each item carries the same location/freshness fields plus `distance` in the
+requested unit. No match is an empty `items` list with `200`. With
+`exclude_stale=true`, up to three times `limit` nearest vehicles are read so
+stale entries can be removed without scanning the entire GEO index; a very
+stale-heavy area may therefore return fewer than `limit` items.
+
+### Freshness and errors
+
+`is_stale` is calculated from `recorded_at` and
+`REDIS_LOCATION_STALE_AFTER_SECONDS` (default `60`); `age_seconds` is clamped
+to zero for future timestamps. Redis key TTLs are never used for freshness and
+stale vehicles are not removed from the GEO index.
+
+| Condition                                  | Status | Error code            |
+| ------------------------------------------ | ------ | --------------------- |
+| No live location for the vehicle           | `404`  | `not_found`           |
+| Invalid UUID, coordinates, unit or bounds  | `422`  | `validation_error`    |
+| Redis unreachable, timing out or corrupt   | `503`  | `service_unavailable` |
+
+Malformed hashes encountered during a page or nearby scan are logged and
+skipped; a corrupt hash requested directly returns `503` instead of pretending
+the vehicle is unknown. Redis is required for these reads: if it is unavailable
+the API answers `503` with the standard envelope and no Redis internals. The
+live projection is rebuildable and is not the source of truth; history,
+geofencing, alerts and ETA features are later milestones.
+
 ## Run the application
 
 ```powershell
@@ -969,12 +1064,12 @@ pytest
 ```
 
 The GPS contract, GPS endpoint wiring, GPS publisher, producer lifecycle,
-consumer processing, consumer transport, Redis live-location, consumer→Redis
-handler, worker lifecycle and simulator tests are unit tests and need no
-infrastructure:
+consumer processing, consumer transport, Redis live-location, live-location
+read APIs, consumer→Redis handler, worker lifecycle and simulator tests are
+unit tests and need no infrastructure:
 
 ```powershell
-pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_gps_live_location_handler.py tests/test_gps_worker_redis.py tests/test_kafka_consumer_infra.py tests/test_live_location.py tests/test_redis_infrastructure.py tests/test_lifespan_redis.py tests/test_simulator.py
+pytest tests/test_gps_schema.py tests/test_gps_ingestion_api.py tests/test_kafka_publisher.py tests/test_gps_consumer_service.py tests/test_gps_live_location_handler.py tests/test_gps_worker_redis.py tests/test_kafka_consumer_infra.py tests/test_live_location.py tests/test_live_location_api.py tests/test_redis_infrastructure.py tests/test_lifespan_redis.py tests/test_simulator.py
 ```
 
 They cover valid and invalid events, coordinate and heading boundaries, naive
@@ -1023,9 +1118,10 @@ pytest -m kafka
 Redis integration tests are marked `redis` (also excluded from the default
 suite). They need the Compose Redis service and cover connection/ping,
 write/read, GEO radius lookup, atomic updates, duplicate and out-of-order
-events, concurrent delivery convergence and repeated updates that must leave
-the hash and GEO index consistent. Every test uses an isolated key namespace
-and deletes its keys:
+events, concurrent delivery convergence, repeated updates that must leave the
+hash and GEO index consistent, rank pagination, stale filtering, empty results
+and read-API smoke tests against real Redis. Every test uses an isolated key
+namespace and deletes its keys:
 
 ```powershell
 docker compose up -d redis
@@ -1175,16 +1271,17 @@ credentials.
 - The database engine and Redis client are each created once per application
   process and disposed during FastAPI shutdown. The standalone GPS worker owns
   a separate Redis client and closes it on shutdown.
-- Authentication, durable GPS persistence, location REST endpoints and
-  Kubernetes remain out of scope. Milestones 5A–5C.2 provide the GPS event
-  contract, a simulator, an HTTP ingestion endpoint, a Kafka producer and a
-  standalone consumer worker: events are validated, published to `gps.events`
-  and consumed at-least-once, but no GPS rows are stored, so `persisted` is
-  always `false` in ingestion responses. The worker's deduplication is
-  in-memory only.
+- Authentication, durable GPS persistence, location history, geofencing,
+  alerts, ETA and Kubernetes remain out of scope. Milestones 5A–5C.2 provide
+  the GPS event contract, a simulator, an HTTP ingestion endpoint, a Kafka
+  producer and a standalone consumer worker: events are validated, published
+  to `gps.events` and consumed at-least-once, but no GPS rows are stored, so
+  `persisted` is always `false` in ingestion responses. The worker's
+  deduplication is in-memory only.
 - Milestone 6.1 adds the Redis client, live-location repository and service;
-  Milestone 6.2 connects the Kafka consumer to that service. No location REST
-  endpoint is exposed yet. Redis holds a rebuildable projection and is not the
-  source of truth.
+  Milestone 6.2 connects the Kafka consumer to that service; Milestone 6.3
+  exposes single, paginated and nearby read endpoints. Redis holds a
+  rebuildable projection and is not the source of truth. List pagination is
+  live, not a snapshot, and `is_stale` filtering scans the GEO index.
 - API tests create uniquely named records and do not truncate existing data;
   use a dedicated test database when running destructive migration checks.

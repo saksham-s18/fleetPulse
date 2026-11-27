@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     # This is deliberately not a Redis key TTL: the last known position stays
     # queryable and is marked stale instead of disappearing.
     redis_location_stale_after_seconds: int = Field(default=60, ge=1)
+    # Read-API limits. The route layer also applies hard upper bounds so a
+    # misconfigured deployment can never request an unbounded Redis scan.
+    # Minimums keep the route defaults (20 and 50) valid for every deployment.
+    redis_location_max_page_size: int = Field(default=100, ge=20, le=500)
+    redis_location_nearby_max_radius_km: float = Field(default=100.0, gt=0)
+    redis_location_nearby_max_limit: int = Field(default=500, ge=50, le=500)
 
     @field_validator("app_env", mode="before")
     @classmethod

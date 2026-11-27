@@ -15,7 +15,7 @@ position.
 """
 
 import logging
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -28,6 +28,7 @@ from app.schemas.live_location import (
     LiveLocationRecord,
     LiveLocationWrite,
     LocationUpdateOutcome,
+    NearbyLocationRecord,
     NearbyVehicle,
 )
 
@@ -35,6 +36,11 @@ logger = logging.getLogger(__name__)
 
 GEO_KEY_SUFFIX = "live:geo"
 LOCATION_KEY_SUFFIX = "live:location"
+
+# One pipelined HGETALL batch per scan step. The value is deliberately small:
+# a stale-filtered page streams the whole GEO index in these batches instead
+# of loading every hash into application memory at once.
+SCAN_BATCH_SIZE = 100
 
 
 class LiveLocationStoreError(Exception):
@@ -245,7 +251,12 @@ class LiveLocationRepository:
         return outcome
 
     async def latest(self, vehicle_id: UUID) -> LiveLocationRecord | None:
-        """Return the stored latest location or ``None`` when never seen."""
+        """Return the stored latest location or ``None`` when never seen.
+
+        A hash that exists but cannot be deserialised is reported as a store
+        error rather than a ``None`` result, because silently treating corrupt
+        data as "vehicle unknown" would be misleading for a single lookup.
+        """
         try:
             fields = await cast(
                 Awaitable[dict[str, Any]],
@@ -258,7 +269,130 @@ class LiveLocationRepository:
                 type(exc).__name__,
             )
             raise LiveLocationStoreError("live-location read failed") from exc
-        return deserialize_location(fields)
+        try:
+            return deserialize_location(fields)
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "Malformed live-location hash for vehicle %s (%s)",
+                vehicle_id,
+                type(exc).__name__,
+            )
+            raise LiveLocationStoreError("live-location record is malformed") from exc
+
+    async def count_indexed(self) -> int:
+        """Return the number of members in the GEO index.
+
+        This is the instantaneous index cardinality, not a snapshot that stays
+        valid across a paginated request sequence.
+        """
+        try:
+            total = await cast(Awaitable[int], self._client.zcard(self._keys.geo))
+        except (RedisError, OSError, TimeoutError) as exc:
+            logger.warning("Live-location index count failed (%s)", type(exc).__name__)
+            raise LiveLocationStoreError("live-location index count failed") from exc
+        return int(total)
+
+    async def page_indexed(self, *, offset: int, limit: int) -> list[LiveLocationRecord]:
+        """Return one rank-ordered page of the GEO index.
+
+        ``ZRANGE`` over the existing GEO sorted set is deterministic for a
+        fixed dataset: members are ordered by their geohash score and then
+        lexicographically. No key scan is performed and only ``limit`` hashes
+        are fetched, in one pipeline. A member whose hash disappeared between
+        the range read and the pipeline is skipped.
+        """
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        members = await self._index_members(offset, offset + limit - 1)
+        return await self._fetch_records(members)
+
+    async def scan_indexed(
+        self,
+        *,
+        batch_size: int = SCAN_BATCH_SIZE,
+    ) -> AsyncIterator[list[LiveLocationRecord]]:
+        """Stream the GEO index in bounded, rank-ordered batches.
+
+        Used only when freshness filtering needs every hash. The whole index is
+        visited with ``ZRANGE`` rank windows (never ``KEYS``); each window is
+        fetched with one pipeline and the caller can stop early. This is
+        ``O(N)`` in the number of indexed vehicles, unlike unfiltered paging.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        start = 0
+        while True:
+            members = await self._index_members(start, start + batch_size - 1)
+            if not members:
+                return
+            records = await self._fetch_records(members)
+            if records:
+                yield records
+            start += len(members)
+
+    async def _index_members(self, start: int, stop: int) -> list[str]:
+        try:
+            raw = await cast(
+                Awaitable[list[str]],
+                self._client.zrange(self._keys.geo, start, stop),
+            )
+        except (RedisError, OSError, TimeoutError) as exc:
+            logger.warning("Live-location index read failed (%s)", type(exc).__name__)
+            raise LiveLocationStoreError("live-location index read failed") from exc
+        return [str(member) for member in raw]
+
+    async def _fetch_records(
+        self,
+        members: Sequence[str],
+    ) -> list[LiveLocationRecord]:
+        """Fetch hashes for ``members``, preserving their order."""
+        records = await self._fetch_records_by_member(members)
+        return [records[member] for member in members if member in records]
+
+    async def _fetch_records_by_member(
+        self,
+        members: Sequence[str],
+    ) -> dict[str, LiveLocationRecord]:
+        """Fetch many hashes with one pipeline and skip malformed entries."""
+        if not members:
+            return {}
+
+        keys: list[tuple[str, str]] = []
+        for member in members:
+            try:
+                vehicle_id = UUID(member)
+            except (ValueError, TypeError):
+                logger.warning("Skipping malformed live-location GEO member")
+                continue
+            keys.append((member, self._keys.location(vehicle_id)))
+        if not keys:
+            return {}
+
+        try:
+            async with self._client.pipeline(transaction=False) as pipeline:
+                for _, key in keys:
+                    pipeline.hgetall(key)
+                results = await cast(Awaitable[list[Any]], pipeline.execute())
+        except (RedisError, OSError, TimeoutError) as exc:
+            logger.warning("Live-location batch read failed (%s)", type(exc).__name__)
+            raise LiveLocationStoreError("live-location batch read failed") from exc
+
+        records: dict[str, LiveLocationRecord] = {}
+        for (member, _), fields in zip(keys, results, strict=False):
+            try:
+                record = deserialize_location(fields)
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning(
+                    "Skipping malformed live-location hash for member %s (%s)",
+                    member,
+                    type(exc).__name__,
+                )
+                continue
+            if record is not None:
+                records[member] = record
+        return records
 
     async def coordinates(self, vehicle_id: UUID) -> tuple[float, float] | None:
         """Return ``(latitude, longitude)`` from the GEO index, if present."""
@@ -318,6 +452,57 @@ class LiveLocationRepository:
                 )
             )
         return vehicles
+
+    async def nearby_records(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_km: float,
+        *,
+        limit: int = 50,
+    ) -> list[NearbyLocationRecord]:
+        """Return nearby vehicles with their full stored location hash.
+
+        ``GEOSEARCH`` supplies the distance ordering; all matching hashes are
+        then fetched with one pipeline instead of one round trip per vehicle.
+        GEO members without a readable hash are skipped so the response never
+        mixes indexed coordinates with missing freshness data.
+        """
+        if radius_km <= 0:
+            raise ValueError("radius_km must be positive")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        try:
+            results = await self._client.geosearch(
+                self._keys.geo,
+                longitude=longitude,
+                latitude=latitude,
+                radius=radius_km,
+                unit="km",
+                sort="ASC",
+                count=limit,
+                withdist=True,
+                withcoord=True,
+            )
+        except (RedisError, OSError, TimeoutError) as exc:
+            logger.warning("Geo radius query failed (%s)", type(exc).__name__)
+            raise LiveLocationStoreError("geo radius query failed") from exc
+
+        members = [str(entry[0]) for entry in results]
+        records = await self._fetch_records_by_member(members)
+        nearby: list[NearbyLocationRecord] = []
+        for entry in results:
+            member, distance, _position = entry
+            record = records.get(str(member))
+            if record is None:
+                continue
+            nearby.append(
+                NearbyLocationRecord(
+                    location=record,
+                    distance_km=float(distance),
+                )
+            )
+        return nearby
 
     async def delete(self, vehicle_id: UUID) -> None:
         """Remove one vehicle from both the hash and the GEO index."""
