@@ -1,6 +1,6 @@
 """Unit tests for ORM metadata. These tests do not require PostgreSQL."""
 
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, DateTime
 
 from app.models import Base
 from app.models.enums import DriverStatus, ShipmentStatus, VehicleStatus
@@ -9,6 +9,7 @@ from app.models.enums import DriverStatus, ShipmentStatus, VehicleStatus
 def test_all_domain_tables_are_registered() -> None:
     assert set(Base.metadata.tables) == {
         "drivers",
+        "gps_telemetry",
         "shipments",
         "vehicle_assignments",
         "vehicles",
@@ -67,6 +68,74 @@ def test_status_columns_have_database_checks() -> None:
             if isinstance(constraint, CheckConstraint)
         }
         assert expected_name in check_names
+
+
+def test_gps_telemetry_uses_event_id_as_primary_key() -> None:
+    table = Base.metadata.tables["gps_telemetry"]
+
+    assert [column.name for column in table.primary_key.columns] == ["event_id"]
+
+
+def test_gps_telemetry_foreign_keys_restrict_deletion() -> None:
+    table = Base.metadata.tables["gps_telemetry"]
+    foreign_keys = {fk.parent.name: fk for fk in table.foreign_keys}
+
+    assert set(foreign_keys) == {"vehicle_id", "shipment_id"}
+    assert all(fk.ondelete == "RESTRICT" for fk in foreign_keys.values())
+    assert foreign_keys["vehicle_id"].target_fullname == "vehicles.id"
+    assert foreign_keys["shipment_id"].target_fullname == "shipments.id"
+    assert foreign_keys["vehicle_id"].parent.nullable is False
+    assert foreign_keys["shipment_id"].parent.nullable is True
+
+
+def test_gps_telemetry_has_range_checks() -> None:
+    table = Base.metadata.tables["gps_telemetry"]
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert checks == {
+        "ck_gps_telemetry_heading_range": "heading IS NULL OR (heading >= 0 AND heading <= 360)",
+        "ck_gps_telemetry_latitude_range": "latitude >= -90 AND latitude <= 90",
+        "ck_gps_telemetry_longitude_range": "longitude >= -180 AND longitude <= 180",
+        "ck_gps_telemetry_speed_kmh_non_negative": "speed_kmh >= 0",
+    }
+
+
+def test_gps_telemetry_indexes_support_newest_first_history() -> None:
+    table = Base.metadata.tables["gps_telemetry"]
+    indexes = {str(index.name): index for index in table.indexes}
+
+    vehicle_index = indexes["ix_gps_telemetry_vehicle_recorded_at"]
+    assert [str(expression) for expression in vehicle_index.expressions] == [
+        "gps_telemetry.vehicle_id",
+        "recorded_at DESC",
+    ]
+    assert vehicle_index.unique is False
+    assert vehicle_index.dialect_options["postgresql"].get("where") is None
+
+    shipment_index = indexes["ix_gps_telemetry_shipment_recorded_at"]
+    assert [str(expression) for expression in shipment_index.expressions] == [
+        "gps_telemetry.shipment_id",
+        "recorded_at DESC",
+    ]
+    assert shipment_index.unique is False
+    where_clause = shipment_index.dialect_options["postgresql"]["where"]
+    assert str(where_clause) == "shipment_id IS NOT NULL"
+
+
+def test_gps_telemetry_timestamp_columns_are_timezone_aware() -> None:
+    table = Base.metadata.tables["gps_telemetry"]
+    recorded_at_type = table.c.recorded_at.type
+    received_at_type = table.c.received_at.type
+
+    assert isinstance(recorded_at_type, DateTime)
+    assert recorded_at_type.timezone is True
+    assert isinstance(received_at_type, DateTime)
+    assert received_at_type.timezone is True
+    assert table.c.received_at.server_default is not None
 
 
 def test_status_enums_expose_expected_values() -> None:

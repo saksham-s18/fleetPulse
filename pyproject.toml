@@ -67,6 +67,12 @@ ignore_missing_imports = true
 module = ["fakeredis", "fakeredis.*"]
 ignore_missing_imports = true
 
+# asyncpg does not ship a py.typed marker, so the migration test treats its
+# API as untyped rather than weakening the rest of the project.
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 addopts = "-ra --strict-markers --strict-config -m 'not integration and not kafka and not redis and not kafka_redis'"
